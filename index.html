@@ -743,7 +743,11 @@ async function loadDashboard() {
       const daysElapsed = isCurMon ? now2.getDate() : (isPastMon ? daysInMonth : 1);
       const avgPerDay   = daysElapsed > 0 ? totalExpExclMtg / daysElapsed : 0;
 
-      const totalBudget = Object.values(budgetMap).reduce((s, v) => s + v, 0);
+      // For groups with no per-cat budgets (e.g. Discretionary as one pot), fall back to group envelope
+      const totalBudget = CAT_GROUPS.reduce((s, g) => {
+        const catSum = g.cats.reduce((cs, c) => cs + (budgetMap[c] || 0), 0);
+        return s + (catSum > 0 ? catSum : (budgetMap[`_grp_${g.label}`] || 0));
+      }, 0);
       const vsBudget    = totalBudget > 0 ? totalExpExclMtg / totalBudget : null;
 
       const catActual = {}, subCatActual = {};
@@ -863,7 +867,7 @@ async function loadDashboard() {
           </tr>${subRows}`;
         }).filter(Boolean).join('');
         if (!catRows) return '';
-        const totBdgt  = group.cats.reduce((s,c) => s + (budgetMap[c]||0), 0);
+        const totBdgt  = group.cats.reduce((s,c) => s + (budgetMap[c]||0), 0) || (budgetMap[`_grp_${group.label}`] || 0);
         const totVsB   = totBdgt > 0 ? groupTotal / totBdgt : null;
         const totColor = totVsB === null ? '' : totVsB > 1 ? 'var(--red)' : totVsB > 0.8 ? 'var(--yellow)' : 'var(--green)';
         return `<tr style="background:var(--bg)">
@@ -1803,7 +1807,7 @@ async function loadBudget() {
       const grpKey      = `_grp_${group.label}`;
       const envelope    = bMap[grpKey] || 0;
       const catAlloc    = group.cats.reduce((s, c) => s + (bMap[c] || 0), 0);
-      totalCatBudget   += catAlloc;
+      totalCatBudget   += catAlloc || envelope; // envelope-only groups (e.g. Discretionary)
       const overAlloc   = envelope > 0 && catAlloc > envelope;
       const underAlloc  = envelope > 0 && catAlloc < envelope;
       const allocPct    = envelope > 0 ? Math.min(catAlloc / envelope, 1) : 0;
