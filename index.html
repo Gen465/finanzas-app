@@ -1934,10 +1934,11 @@ async function loadRunway() {
     const todayMk  = monthKey(now.getMonth(), now.getFullYear());
     const minMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
 
-    const [accounts, txExp, txInc, sbSettings] = await Promise.all([
+    const [accounts, txExp, txInc, txTrans, sbSettings] = await Promise.all([
       dbGet('accounts', '?select=name,balance'),
       dbGet('transactions', '?type=eq.Expense&select=amount,month_year,category'),
       dbGet('transactions', '?type=eq.Income&select=amount,month_year,category'),
+      dbGet('transactions', '?type=eq.Transfer&select=amount,month_year,from_account,category'),
       dbGet('app_settings', '?key=in.(rw_income,rw_incomeUntil,rw_target,rw_pace)').catch(() => [])
     ]);
 
@@ -1978,6 +1979,18 @@ async function loadRunway() {
     txInc.filter(r => r.category !== 'Valuacion')
          .forEach(r => { cashIncByMonth[r.month_year] = (cashIncByMonth[r.month_year] || 0) + +r.amount; });
 
+    // ── Historical liquid pool reconstruction (walk backwards from today's known balance) ─
+    // Simple add/subtract: balance at end of each past month is estimated by undoing net flows.
+    const allHistMks = [...new Set([...Object.keys(expByMonth), ...Object.keys(cashIncByMonth)])].sort(mkSort);
+    const liquidByMonth = {};
+    let trailingLiq = netLiquid;
+    for (let i = allHistMks.length - 1; i >= 0; i--) {
+      const mk = allHistMks[i];
+      liquidByMonth[mk] = Math.max(0, trailingLiq);
+      // Going backwards: undo this month's net effect (income added, expenses subtracted)
+      trailingLiq -= (cashIncByMonth[mk] || 0) - (expByMonth[mk] || 0);
+    }
+
     const recentNetBurn = completeMks.length > 0
       ? completeMks.reduce((s, mk) => s + (expByMonth[mk] || 0) - (cashIncByMonth[mk] || 0), 0) / completeMks.length
       : null;
@@ -2009,25 +2022,79 @@ async function loadRunway() {
       return MONTHS_ES[d.getMonth()] + '-' + String(d.getFullYear()).slice(2);
     };
 
-    // ── Expected vs Actual table data (all complete months, from Apr-26) ──────
+    // ── Unified table: past history + TODAY + future projections ─────────────
     const allCompleteMks = [...new Set(
       txExp.filter(r => r.month_year !== todayMk).map(r => r.month_year)
     )].sort(mkSort).filter(mk => mkSort(mk, 'Abr-26') >= 0);
 
-    const tableRows = allCompleteMks.map(mk => {
-      const actual    = expByMonth[mk] || 0;
-      const vTgt      = target > 0          ? actual - target         : null;
-      const vPace     = recentNetBurn > 0   ? actual - recentNetBurn  : null;
-      const tgtColor  = vTgt  === null ? '' : vTgt  > 0 ? 'var(--red)' : 'var(--green)';
-      const paceColor = vPace === null ? '' : vPace > 0 ? 'var(--red)' : 'var(--green)';
-      const TD        = 'padding:7px 8px;font-size:0.78rem;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums';
+    const RTHTD = 'padding:7px 8px;font-size:0.78rem;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums';
+
+    // Past rows: Month | Actual Spend | vs Target | Actual Liquid (reconstructed)
+    const pastTableRows = allCompleteMks.map(mk => {
+      const actual = expByMonth[mk] || 0;
+      const liq    = liquidByMonth[mk];
+      const vTgt   = target > 0 ? actual - target : null;
+      const tgtC   = vTgt === null ? '' : vTgt > 0 ? 'var(--red)' : 'var(--green)';
+      const liqC   = liq !== undefined && liq < netLiquid * 0.3 ? 'var(--red)' : 'var(--muted)';
       return `<tr>
-        <td style="${TD};font-weight:500">${mk}</td>
-        <td style="${TD};text-align:right;font-weight:600">${fmt(actual,0)}</td>
-        <td style="${TD};text-align:right;font-weight:700;color:${tgtColor}">${vTgt  !== null ? (vTgt  > 0 ? '+' : '') + fmt(vTgt,0)  : '—'}</td>
-        <td style="${TD};text-align:right;font-weight:700;color:${paceColor}">${vPace !== null ? (vPace > 0 ? '+' : '') + fmt(vPace,0) : '—'}</td>
+        <td style="${RTHTD};font-weight:500">${mk}</td>
+        <td style="${RTHTD};text-align:right;font-weight:600">${fmt(actual,0)}</td>
+        <td style="${RTHTD};text-align:right;font-weight:700;color:${tgtC}">${vTgt !== null ? (vTgt > 0 ? '+' : '') + fmt(vTgt,0) : '—'}</td>
+        <td style="${RTHTD};text-align:right;color:${liqC};font-style:italic">${liq !== undefined ? fmt(liq,0) : '—'}</td>
       </tr>`;
-    }).join(''); // chronological — oldest first
+    }).join('');
+
+    // NOW separator row (blue banner)
+    const todaySepRow = `
+      <tr style="background:var(--accent)">
+        <td colspan="4" style="padding:7px 8px;font-size:0.72rem;font-weight:700;color:white;text-align:center;letter-spacing:0.03em">
+          NOW · Liquid: ${fmt(netLiquid,0)}
+        </td>
+      </tr>`;
+
+    // Future projection rows: Month | Projected Spend | — | Projected Liquid
+    const futProjRows = [];
+    let liqTgt = netLiquid, liqPace = netLiquid;
+    const futLimit = Math.min(36, Math.ceil(Math.max(runwayTarget ?? 0, runwayRecent ?? 0, 6)) + 2);
+    for (let i = 1; i <= futLimit; i++) {
+      const fd      = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      const fmk     = monthKey(fd.getMonth(), fd.getFullYear());
+      const inIncP  = incomeAmt > 0 && incomeMos > 0 && i <= incomeMos;
+      const tgtBurn = target > 0 ? (inIncP ? Math.max(0, target - incomeAmt) : target) : 0;
+      const paceBurn = recentNetBurn ?? 0;
+      liqTgt  = Math.max(0, liqTgt  - tgtBurn);
+      liqPace = Math.max(0, liqPace - paceBurn);
+      const showLiq  = target > 0 ? liqTgt : liqPace;
+      const showBurn = target > 0 ? tgtBurn : (paceBurn > 0 ? paceBurn : 0);
+      const liqC    = showLiq < 5000 ? 'var(--red)' : showLiq < netLiquid * 0.4 ? 'var(--yellow)' : 'var(--muted)';
+      futProjRows.push(`<tr style="opacity:0.72">
+        <td style="${RTHTD};font-style:italic">${fmk}</td>
+        <td style="${RTHTD};text-align:right;font-style:italic;color:var(--muted)">${showBurn > 0 ? fmt(showBurn,0) : '—'}</td>
+        <td style="${RTHTD};text-align:right;font-style:italic;color:var(--muted)">—</td>
+        <td style="${RTHTD};text-align:right;font-weight:700;color:${liqC}">${fmt(showLiq,0)}</td>
+      </tr>`);
+      if (liqTgt <= 0 && liqPace <= 0) break;
+    }
+
+    const unifiedTable = `
+      <div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">
+        <table style="width:100%;border-collapse:collapse">
+          <thead><tr style="background:var(--bg)">
+            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:left">Month</th>
+            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:right">Spend</th>
+            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:right">vs Target${target > 0 ? ` (${fmt(target,0)})` : ''}</th>
+            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:right">Liquid</th>
+          </tr></thead>
+          <tbody>
+            ${pastTableRows || '<tr><td colspan="4" style="padding:20px;text-align:center;color:var(--muted);font-size:0.82rem">No historical data yet</td></tr>'}
+            ${todaySepRow}
+            ${futProjRows.join('')}
+          </tbody>
+        </table>
+        <div style="padding:6px 10px;font-size:0.64rem;color:var(--muted);border-top:1px solid var(--border);background:var(--bg)">
+          Past liquid estimated by walking backwards from today's known balance · Future projected at @target${recentNetBurn ? ' / @pace' : ''}
+        </div>
+      </div>`;
 
     const paceBtns = [1,3,6].map(n => {
       const a = paceWindow === n;
@@ -2086,121 +2153,207 @@ async function loadRunway() {
         ${recentNetBurn !== null ? `<div style="font-size:0.72rem;color:var(--muted);margin-top:4px">Recent pace: avg ${fmt(recentNetBurn,0)}/mo net (${completeMks.join(', ')})</div>` : ''}
       </div>
 
-      <div class="section-label">Balance Projection · from today</div>
+      <div class="section-label">Liquid Balance Journey · April → Zero</div>
       <div class="card" style="padding:12px 16px;margin-bottom:14px">
-        <div style="position:relative;height:200px"><canvas id="runwayCanvas"></canvas></div>
+        <div style="position:relative;height:220px"><canvas id="runwayCanvas"></canvas></div>
       </div>
 
-      <div class="section-label">Expected vs Actual</div>
+      <div class="section-label">Monthly Spend vs Target · April → Zero</div>
       <div class="card" style="padding:12px 16px;margin-bottom:14px">
-        <div style="position:relative;height:200px"><canvas id="rwActualCanvas"></canvas></div>
+        <div style="position:relative;height:180px"><canvas id="rwActualCanvas"></canvas></div>
       </div>
-      <div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">
-        <table style="width:100%;border-collapse:collapse">
-          <thead><tr style="background:var(--bg)">
-            <th style="padding:7px 8px;font-size:0.65rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:left;border-bottom:2px solid var(--border)">Month</th>
-            <th style="padding:7px 8px;font-size:0.65rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:right;border-bottom:2px solid var(--border)">Actual</th>
-            <th style="padding:7px 8px;font-size:0.65rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:right;border-bottom:2px solid var(--border)">vs Tgt${target > 0 ? ` (${fmt(target,0)})` : ''}</th>
-            <th style="padding:7px 8px;font-size:0.65rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:right;border-bottom:2px solid var(--border)">vs Pace${recentNetBurn !== null ? ` (${fmt(recentNetBurn,0)})` : ''}</th>
-          </tr></thead>
-          <tbody>${tableRows || '<tr><td colspan="4" style="padding:20px;text-align:center;color:var(--muted);font-size:0.82rem">No historical data yet</td></tr>'}</tbody>
-        </table>
-      </div>`;
+      <div class="section-label">History & Projections</div>
+      ${unifiedTable}`;
 
-    // Balance projection chart — both scenarios
-    if (netLiquid > 0) {
-      renderRunwayChart(netLiquid, target, recentNetBurn, incomeAmt, incomeMos, runwayTarget, runwayRecent, now);
-    }
+    // Graph 1: Liquid Balance Journey — past actual + target-path lines, future @target + @pace projections
+    renderRunwayChart(netLiquid, target, recentNetBurn, incomeAmt, incomeMos, runwayTarget, runwayRecent, now, allCompleteMks, liquidByMonth);
 
-    // Actual vs target chart
-    if (allCompleteMks.length > 0) {
-      renderActualVsTargetChart(allCompleteMks, expByMonth, target, recentNetBurn);
-    }
+    // Graph 2: Monthly Spend vs Target — actual bars (past) + ghost bars (future) + orange target line
+    renderActualVsTargetChart(allCompleteMks, expByMonth, target, recentNetBurn, now, runwayTarget, runwayRecent, incomeAmt, incomeMos);
 
   } catch(e) {
     el.innerHTML = `<div class="placeholder"><div class="icon">⚠️</div><h2>Error</h2><p>${e.message}</p></div>`;
   }
 }
 
-function renderRunwayChart(startBalance, targetBurn, recentBurn, incomeAmt, incomeMos, runwayTarget, runwayRecent, now) {
+function renderRunwayChart(netLiquid, target, recentBurn, incomeAmt, incomeMos, runwayTarget, runwayRecent, now, pastMks, liquidByMonth) {
   const canvas = document.getElementById('runwayCanvas');
   if (!canvas) return;
   if (runwayChart) { runwayChart.destroy(); runwayChart = null; }
 
-  // Size the chart to fit the longest scenario, not just stress
-  const rwT = runwayTarget ?? (targetBurn > 0 ? startBalance / Math.max(targetBurn - incomeAmt, targetBurn * 0.1) : 0);
-  const rwR = runwayRecent ?? (recentBurn  > 0 ? startBalance / recentBurn  : 0);
-  const maxMonths = Math.min(Math.ceil(Math.max(rwT, rwR, 1)) + 3, 84);
+  // Helper: month key → Date object
+  const mkToDate = mk => { const [mo, yr] = mk.split('-'); return new Date(2000 + +yr, MONTHS_ES.indexOf(mo), 1); };
 
-  const labels = Array.from({ length: maxMonths + 1 }, (_, i) => {
-    if (i === 0) return 'Now';
-    const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
-    return MONTHS_ES[d.getMonth()] + '-' + String(d.getFullYear()).slice(2);
+  // Anchor: April 2026
+  const ANCHOR = 'Abr-26';
+  const ANCHOR_DATE = new Date(2026, 3, 1);
+  const todayMk = monthKey(now.getMonth(), now.getFullYear());
+
+  // Past: complete months from April-26 onwards, sorted
+  const validPast = (pastMks || [])
+    .filter(mk => { const d = mkToDate(mk); return d >= ANCHOR_DATE && mk !== todayMk; })
+    .sort(mkSort);
+
+  // Future window: until both projections hit zero
+  const rwT = runwayTarget ?? 0;
+  const rwR = runwayRecent ?? 0;
+  const maxFuture = Math.min(Math.ceil(Math.max(rwT, rwR, 2)) + 3, 84);
+
+  // Future month labels starting from the month AFTER today
+  const futureMks = Array.from({ length: maxFuture }, (_, i) => {
+    const d = new Date(now.getFullYear(), now.getMonth() + i + 1, 1);
+    return monthKey(d.getMonth(), d.getFullYear());
   });
+
+  // Full X-axis: past months + 'NOW' divider + future months
+  const allLabels = [...validPast, 'NOW', ...futureMks];
+  const nowIdx = validPast.length; // index of 'NOW'
 
   const datasets = [];
 
-  // At-target line (with income offset during income period)
-  if (targetBurn > 0) {
-    const targetData = Array.from({ length: maxMonths + 1 }, (_, i) => {
-      let bal = startBalance;
-      for (let m = 0; m < i; m++) {
-        bal -= m < incomeMos ? Math.max(0, targetBurn - incomeAmt) : targetBurn;
+  // ── Dataset 1: Actual past liquid (solid dark, past section + NOW point) ──
+  {
+    const data = allLabels.map((lbl, i) => {
+      if (i < nowIdx) return (liquidByMonth && liquidByMonth[lbl] !== undefined) ? liquidByMonth[lbl] : null;
+      if (i === nowIdx) return netLiquid;
+      return null;
+    });
+    if (data.some(v => v !== null)) {
+      datasets.push({
+        label: 'Actual liquid',
+        data,
+        borderColor: '#374151',
+        backgroundColor: 'rgba(55,65,81,0.07)',
+        borderWidth: 2.5, pointRadius: 3, pointBackgroundColor: '#374151',
+        tension: 0.2, fill: false, order: 4, spanGaps: true
+      });
+    }
+  }
+
+  // ── Dataset 2: Target should-have-been (dashed green, past section + NOW) ──
+  // Starts at April's liquid; each subsequent month subtracts the target net burn.
+  // April = no income; May onwards = max(0, target - incomeAmt) if in income window.
+  if (target > 0) {
+    const aprLiq = (liquidByMonth && liquidByMonth[ANCHOR] !== undefined) ? liquidByMonth[ANCHOR] : netLiquid;
+    const data = allLabels.map((lbl, i) => {
+      if (i > nowIdx) return null;
+      if (lbl === ANCHOR) return aprLiq;
+      // Months elapsed from April (month 3, 2026) to this label
+      const labelDate = lbl === 'NOW' ? now : mkToDate(lbl);
+      const monthsFromApr = (labelDate.getFullYear() - 2026) * 12 + (labelDate.getMonth() - 3);
+      let bal = aprLiq;
+      for (let m = 1; m <= monthsFromApr; m++) {
+        // m=1 = May (first income month); income applies if incomeAmt > 0
+        const hasIncome = incomeAmt > 0 && m >= 1; // May onwards
+        bal -= hasIncome ? Math.max(0, target - incomeAmt) : target;
+        if (bal <= 0) return 0;
+      }
+      // For the 'NOW' label: add fractional burn of the current partial month
+      if (lbl === 'NOW') {
+        const hasIncome = incomeAmt > 0 && monthsFromApr >= 1;
+        const monthBurn = hasIncome ? Math.max(0, target - incomeAmt) : target;
+        bal -= monthBurn * (now.getDate() / 30);
+      }
+      return Math.max(0, bal);
+    });
+    datasets.push({
+      label: `Target path (${fmt(target,0)}/mo)`,
+      data,
+      borderColor: 'rgba(5,150,105,0.75)',
+      backgroundColor: 'transparent',
+      borderWidth: 2, borderDash: [6, 3], pointRadius: 0,
+      tension: 0.2, fill: false, order: 3, spanGaps: true
+    });
+  }
+
+  // ── Dataset 3: @Target projection (solid green, NOW + future) ──
+  if (target > 0) {
+    const data = allLabels.map((lbl, i) => {
+      if (i < nowIdx) return null;
+      const fi = i - nowIdx; // 0 = NOW, 1 = 1st future month, …
+      let bal = netLiquid;
+      for (let m = 0; m < fi; m++) {
+        const hasIncome = incomeAmt > 0 && m < incomeMos;
+        bal -= hasIncome ? Math.max(0, target - incomeAmt) : target;
         if (bal <= 0) return 0;
       }
       return Math.max(0, bal);
     });
-    const lbl = incomeAmt > 0 && incomeMos > 0
-      ? `At target (${fmt(targetBurn,0)}/mo, ${incomeMos} mo income)`
-      : `At target (${fmt(targetBurn,0)}/mo)`;
     datasets.push({
-      label: lbl,
-      data: targetData,
-      borderColor: 'rgba(5,150,105,0.9)',
+      label: `@Target`,
+      data,
+      borderColor: 'rgba(5,150,105,0.95)',
       backgroundColor: 'rgba(5,150,105,0.07)',
-      borderWidth: 2.5, pointRadius: 0, tension: 0.15, fill: true
+      borderWidth: 2.5, pointRadius: 0,
+      tension: 0.15, fill: true, order: 1
     });
   }
 
-  // At-recent-pace line (net burn already accounts for income, straight decline)
-  if (recentBurn > 0) {
-    const recentData = Array.from({ length: maxMonths + 1 }, (_, i) =>
-      Math.max(0, startBalance - recentBurn * i)
-    );
+  // ── Dataset 4: @Pace projection (blue dashed, NOW + future) ──
+  if (recentBurn && recentBurn > 0) {
+    const data = allLabels.map((lbl, i) => {
+      if (i < nowIdx) return null;
+      return Math.max(0, netLiquid - recentBurn * (i - nowIdx));
+    });
     datasets.push({
-      label: `At recent pace (${fmt(recentBurn,0)}/mo net)`,
-      data: recentData,
+      label: `@Pace (${fmt(recentBurn,0)}/mo net)`,
+      data,
       borderColor: 'rgba(59,130,246,0.85)',
       backgroundColor: 'transparent',
-      borderWidth: 2, borderDash: [5, 3], pointRadius: 0, tension: 0, fill: false
+      borderWidth: 2, borderDash: [5, 3], pointRadius: 0,
+      tension: 0, fill: false, order: 2
     });
   }
 
   if (!datasets.length) return;
 
+  // Inline plugin: vertical "NOW" divider with label
+  const nowLinePlugin = {
+    id: 'nowLine',
+    afterDraw(chart) {
+      const { ctx, chartArea, scales } = chart;
+      const x = scales.x.getPixelForValue(nowIdx);
+      if (!x || !chartArea) return;
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x, chartArea.top);
+      ctx.lineTo(x, chartArea.bottom);
+      ctx.strokeStyle = 'rgba(30,64,175,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(30,64,175,0.75)';
+      ctx.font = 'bold 9px sans-serif';
+      ctx.fillText('NOW', x + 3, chartArea.top + 11);
+      ctx.restore();
+    }
+  };
+
   runwayChart = new Chart(canvas, {
     type: 'line',
-    data: { labels, datasets },
+    data: { labels: allLabels, datasets },
+    plugins: [nowLinePlugin],
     options: {
       responsive: true,
       maintainAspectRatio: false,
       plugins: {
         legend: {
-          display: datasets.length > 1,
+          display: true,
           position: 'bottom',
           labels: { boxWidth: 10, font: { size: 10 }, padding: 10 }
         },
         tooltip: {
           mode: 'index', intersect: false,
           callbacks: {
-            label: c => c.raw != null ? ` ${c.dataset.label}: ${fmt(c.raw, 0)}` : '',
-            title: ts => labels[ts[0].dataIndex]
+            label: c => c.raw != null ? ` ${c.dataset.label}: ${fmt(c.raw, 0)}` : ''
           }
         }
       },
       scales: {
         x: { grid: { display: false }, ticks: { font: { size: 9 }, maxTicksLimit: 14 } },
         y: {
+          min: 0,
           grid: { color: 'rgba(0,0,0,0.04)' },
           ticks: { font: { size: 9 }, callback: v => v >= 1000 ? `€${(v/1000).toFixed(0)}k` : `€${v}` }
         }
@@ -2209,50 +2362,65 @@ function renderRunwayChart(startBalance, targetBurn, recentBurn, incomeAmt, inco
   });
 }
 
-function renderActualVsTargetChart(mks, expByMonth, target, recentBurn) {
+function renderActualVsTargetChart(pastMks, expByMonth, target, recentBurn, now, runwayTarget, runwayRecent, incomeAmt, incomeMos) {
   const canvas = document.getElementById('rwActualCanvas');
   if (!canvas) return;
   if (rwActualChart) { rwActualChart.destroy(); rwActualChart = null; }
 
-  const labels  = mks; // all months, chronological (Apr onwards)
-  const actuals = labels.map(mk => expByMonth[mk] || 0);
-  const overTarget = actuals.map(v => target > 0 && v > target);
+  // Match Graph 1 x-axis end point
+  const rwT = runwayTarget ?? 0;
+  const rwR = runwayRecent ?? 0;
+  const maxFuture = Math.min(Math.ceil(Math.max(rwT, rwR, 2)) + 3, 84);
 
-  const barColors   = overTarget.map(over => over ? 'rgba(220,38,38,0.72)' : 'rgba(5,150,105,0.72)');
-  const borderColors= overTarget.map(over => over ? '#dc2626' : '#059669');
+  // Future month labels (next month after today onwards)
+  const futureMks = now ? Array.from({ length: maxFuture }, (_, i) => {
+    const d = new Date(now.getFullYear(), now.getMonth() + i + 1, 1);
+    return monthKey(d.getMonth(), d.getFullYear());
+  }) : [];
+
+  // X-axis: past complete months (April→) then future months
+  const allLabels = [...(pastMks || []), ...futureMks];
+  const pastCount = (pastMks || []).length;
+
+  // Bar heights: actual spend for past, target spend for future (ghost bars)
+  const barData = allLabels.map((mk, i) => {
+    if (i < pastCount) return expByMonth[mk] || 0;
+    return target > 0 ? target : 0; // future: show target level as ghost
+  });
+
+  // Bar colours: past (green/red by vs-target), future (light grey ghost)
+  const barBg = allLabels.map((mk, i) => {
+    if (i < pastCount) {
+      const actual = expByMonth[mk] || 0;
+      return (target > 0 && actual > target) ? 'rgba(220,38,38,0.72)' : 'rgba(5,150,105,0.72)';
+    }
+    return 'rgba(156,163,175,0.28)'; // ghost
+  });
+  const barBorder = allLabels.map((mk, i) => {
+    if (i < pastCount) {
+      const actual = expByMonth[mk] || 0;
+      return (target > 0 && actual > target) ? '#dc2626' : '#059669';
+    }
+    return 'rgba(156,163,175,0.45)';
+  });
 
   const datasets = [{
-    label: 'Actual Spend',
-    data: actuals,
-    backgroundColor: barColors,
-    borderColor: borderColors,
+    label: 'Monthly Spend',
+    data: barData,
+    backgroundColor: barBg,
+    borderColor: barBorder,
     borderWidth: 1,
     borderRadius: 3
   }];
 
+  // Orange horizontal target line spanning all months
   if (target > 0) {
     datasets.push({
-      label: `Target (${fmt(target, 0)})`,
-      data: labels.map(() => target),
+      label: `Target (${fmt(target, 0)}/mo)`,
+      data: allLabels.map(() => target),
       type: 'line',
-      borderColor: '#d97706',
-      borderDash: [5, 3],
+      borderColor: '#f97316',
       borderWidth: 2,
-      pointRadius: 0,
-      fill: false,
-      tension: 0,
-      order: 0
-    });
-  }
-
-  if (recentBurn > 0) {
-    datasets.push({
-      label: `Pace (${fmt(recentBurn, 0)})`,
-      data: labels.map(() => recentBurn),
-      type: 'line',
-      borderColor: '#3b82f6',
-      borderDash: [3, 3],
-      borderWidth: 1.5,
       pointRadius: 0,
       fill: false,
       tension: 0,
@@ -2262,7 +2430,7 @@ function renderActualVsTargetChart(mks, expByMonth, target, recentBurn) {
 
   rwActualChart = new Chart(canvas, {
     type: 'bar',
-    data: { labels, datasets },
+    data: { labels: allLabels, datasets },
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -2274,12 +2442,15 @@ function renderActualVsTargetChart(mks, expByMonth, target, recentBurn) {
         },
         tooltip: {
           mode: 'index', intersect: false,
-          callbacks: { label: c => ` ${c.dataset.label}: ${fmt(c.raw, 0)}` }
+          callbacks: {
+            label: c => c.raw != null ? ` ${c.dataset.label}: ${fmt(c.raw, 0)}` : ''
+          }
         }
       },
       scales: {
-        x: { grid: { display: false }, ticks: { font: { size: 9 } } },
+        x: { grid: { display: false }, ticks: { font: { size: 9 }, maxTicksLimit: 14 } },
         y: {
+          min: 0,
           grid: { color: 'rgba(0,0,0,0.04)' },
           ticks: { font: { size: 9 }, callback: v => v >= 1000 ? `€${(v/1000).toFixed(0)}k` : `€${v}` }
         }
