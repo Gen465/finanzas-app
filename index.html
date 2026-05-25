@@ -6,6 +6,7 @@
   <title>Finanzas</title>
   <link rel="manifest" href="manifest.json">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
   <meta name="theme-color" content="#1e40af">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -442,7 +443,20 @@
 
     <!-- Settings -->
     <div class="tab-panel" id="tab-settings">
-      <div class="section-label">Import from OneMoneyApp</div>
+
+      <div class="section-label">OneDrive Import</div>
+      <div class="card" id="odCard">
+        <div id="odStatus" style="font-size:0.82rem;color:var(--muted);margin-bottom:12px">Checking…</div>
+        <button id="odConnectBtn" class="btn btn-primary btn-block" onclick="connectOneDrive()" style="display:none">
+          Connect OneDrive
+        </button>
+        <button id="odImportBtn" class="btn btn-primary btn-block" onclick="importFromOneDrive()" style="display:none">
+          ⬇ Import Latest CSV
+        </button>
+        <div id="odLatest" style="font-size:0.72rem;color:var(--muted);margin-top:8px;text-align:center"></div>
+      </div>
+
+      <div class="section-label">Manual Import</div>
       <div class="card">
         <div class="card-title">Select CSV File</div>
         <p style="font-size:0.85rem;color:var(--muted);margin-bottom:14px;line-height:1.5">
@@ -456,6 +470,18 @@
       </div>
 
       <div id="importPreview" style="display:none"></div>
+
+      <div class="section-label">Danger Zone</div>
+      <div class="card" style="border:1px solid var(--red-light)">
+        <div class="card-title" style="color:var(--red)">Wipe All Transactions</div>
+        <p style="font-size:0.82rem;color:var(--muted);margin-bottom:14px;line-height:1.5">
+          Deletes every transaction from the database. Account balances are kept. Use this before a full re-import.
+        </p>
+        <button class="btn btn-block" onclick="wipeTransactions()"
+          style="background:var(--red);color:#fff;border:none;padding:12px;border-radius:var(--radius);font-size:0.9rem;font-weight:600;cursor:pointer;font-family:var(--font)">
+          🗑 Wipe All Transactions
+        </button>
+      </div>
 
       <div id="importLog"><div class="spinner"></div></div>
     </div>
@@ -590,7 +616,7 @@ function switchTab(tab) {
   if (tab === 'balances')     loadBalances();
   if (tab === 'runway')       loadRunway();
   if (tab === 'mortgage')     loadMortgage();
-  if (tab === 'settings')     loadImportLog();
+  if (tab === 'settings')     { loadImportLog(); initOneDrive(); }
 }
 
 document.querySelectorAll('.nav-btn').forEach(b =>
@@ -2298,6 +2324,141 @@ async function seedIfEmpty() {
     await dbPost('budget_targets', SEED_BUDGET, true);
     toast('Categories & budgets ready');
   }
+}
+
+// ── OneDrive Import ──────────────────────────────────────────────────────────
+const MSAL_CONFIG = {
+  auth: {
+    clientId: '18011266-b5dc-4f5f-b26d-46d2628e2605',
+    authority: 'https://login.microsoftonline.com/common',
+    redirectUri: 'https://gen465.github.io/finanzas-app/'
+  },
+  cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: false }
+};
+const OD_SCOPES   = ['Files.Read'];
+const OD_FOLDER   = 'Finanzas/OneMoneyApp';
+let msalInstance  = null;
+
+function getMSAL() {
+  if (!msalInstance) msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
+  return msalInstance;
+}
+
+async function getODToken() {
+  const app      = getMSAL();
+  const accounts = app.getAllAccounts();
+  if (accounts.length === 0) return null;
+  try {
+    const res = await app.acquireTokenSilent({ scopes: OD_SCOPES, account: accounts[0] });
+    return res.accessToken;
+  } catch { return null; }
+}
+
+async function initOneDrive() {
+  const statusEl  = document.getElementById('odStatus');
+  const connectBtn= document.getElementById('odConnectBtn');
+  const importBtn = document.getElementById('odImportBtn');
+  if (!statusEl) return;
+  const token = await getODToken();
+  if (token) {
+    const acc = getMSAL().getAllAccounts()[0];
+    statusEl.textContent = `Connected as ${acc.username}`;
+    importBtn.style.display = 'block';
+    connectBtn.style.display = 'none';
+    await refreshLatestFileName(token);
+  } else {
+    statusEl.textContent = 'Not connected';
+    connectBtn.style.display = 'block';
+    importBtn.style.display = 'none';
+  }
+}
+
+async function connectOneDrive() {
+  try {
+    const app = getMSAL();
+    const res = await app.loginPopup({ scopes: OD_SCOPES });
+    app.setActiveAccount(res.account);
+    await initOneDrive();
+  } catch(e) { toast('OneDrive login cancelled'); }
+}
+
+async function refreshLatestFileName(token) {
+  const latestEl = document.getElementById('odLatest');
+  if (!latestEl) return;
+  try {
+    const info = await fetchLatestCSVInfo(token);
+    latestEl.textContent = info ? `Latest: ${info.name}` : 'No CSV files found in folder';
+  } catch { latestEl.textContent = ''; }
+}
+
+async function fetchLatestCSVInfo(token) {
+  const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FOLDER}:/children?$select=name,id&$top=100`;
+  const r   = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!r.ok) throw new Error('Could not read OneDrive folder');
+  const items = (await r.json()).value || [];
+  const csvs  = items.filter(f => /^1Money_\d{2}_\d{2}_\d{4}\.csv$/i.test(f.name));
+  if (!csvs.length) return null;
+  // Sort by date embedded in filename: 1Money_DD_MM_YYYY.csv
+  csvs.sort((a, b) => {
+    const parse = n => { const p = n.replace('.csv','').split('_'); return new Date(`${p[3]}-${p[2]}-${p[1]}`); };
+    return parse(b.name) - parse(a.name);
+  });
+  return csvs[0];
+}
+
+async function importFromOneDrive() {
+  const btn = document.getElementById('odImportBtn');
+  const latestEl = document.getElementById('odLatest');
+  btn.disabled = true;
+  btn.textContent = 'Fetching…';
+  try {
+    const token = await getODToken();
+    if (!token) { await connectOneDrive(); return; }
+    const info = await fetchLatestCSVInfo(token);
+    if (!info) { toast('No CSV files found in OneDrive folder'); return; }
+    latestEl.textContent = `Importing: ${info.name}…`;
+    const dlUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${OD_FOLDER}/${info.name}:/content`;
+    const dlRes = await fetch(dlUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (!dlRes.ok) throw new Error('Could not download file');
+    const text = await dlRes.text();
+    const { transactions, balances } = parseCSVFile(text);
+    if (!transactions.length) { toast('No transactions found in file'); return; }
+    btn.textContent = 'Importing…';
+    // Deduplicate
+    const dates = transactions.map(t => t.date).sort();
+    const existing = await dbGet('transactions', `?date=gte.${dates[0]}&date=lte.${dates[dates.length-1]}&select=date,type,from_account,category,amount`);
+    const existingKeys = new Set(existing.map(dedupKey));
+    const newTx = transactions.filter(t => !existingKeys.has(dedupKey(t)));
+    // Insert in batches
+    for (let i = 0; i < newTx.length; i += 100)
+      await dbPost('transactions', newTx.slice(i, i+100));
+    await updateAccountBalances(balances);
+    await dbPost('import_log', { filename: info.name, row_count: newTx.length });
+    toast(`✅ ${newTx.length} new transactions imported`);
+    latestEl.textContent = `Latest: ${info.name}`;
+    loadImportLog();
+    if (activeTab === 'dashboard') loadDashboard();
+  } catch(e) {
+    toast('Import failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⬇ Import Latest CSV';
+  }
+}
+
+async function wipeTransactions() {
+  const confirmed = confirm('Delete ALL transactions? This cannot be undone.\n\nAccount balances will be kept.');
+  if (!confirmed) return;
+  const confirmed2 = confirm('Are you sure? This deletes everything.');
+  if (!confirmed2) return;
+  try {
+    await fetch(`${SB_URL}/rest/v1/transactions?date=gte.2000-01-01`, {
+      method: 'DELETE', headers: HEADERS
+    });
+    toast('✅ All transactions wiped');
+    loadImportLog();
+    if (activeTab === 'dashboard') loadDashboard();
+  } catch(e) { toast('Wipe failed: ' + e.message); }
 }
 
 // ── CSV Import ──────────────────────────────────────────────────────────────
