@@ -493,7 +493,7 @@
       <span class="nav-icon">📊</span>Dashboard
     </button>
     <button class="nav-btn" data-tab="transactions">
-      <span class="nav-icon">💸</span>Moves
+      <span class="nav-icon">💸</span>Activity
     </button>
     <button class="nav-btn" data-tab="budget">
       <span class="nav-icon">🎯</span>Budget
@@ -536,9 +536,10 @@ let txCatF     = '';
 let txAcctF    = '';
 
 const NW_GROUPS = [
-  { label:'Transactional', color:'#3b82f6', accounts:['Debito ING','Debit ABN','Apartados ING','Apartados ABN','TDC - ING','AMEX-TDC'] },
-  { label:'Investments',   color:'#059669', accounts:['ETFMatic','Openbank','Trade212'] },
-  { label:'Real Estate',   color:'#8b5cf6', accounts:['House','Mortgage Principal'] }
+  { label:'Cash',        color:'#3b82f6', accounts:['Debito ING','Debit ABN','Apartados ING','Apartados ABN','TDC - ING','AMEX-TDC'] },
+  { label:'Savings',     color:'#06b6d4', accounts:['Trade212'] },
+  { label:'Investments', color:'#059669', accounts:['ETFMatic','Openbank'] },
+  { label:'Home Equity', color:'#8b5cf6', accounts:['House','Mortgage Principal'] }
 ];
 
 const CAT_GROUPS = [
@@ -599,7 +600,7 @@ function monthKey(m, yr) { return `${MONTHS_ES[m]}-${yy(yr)}`; }
 
 // ── Tab switching ───────────────────────────────────────────────────────────
 const TAB_LABELS = {
-  dashboard:'Dashboard', transactions:'Transactions', budget:'Budget',
+  dashboard:'Dashboard', transactions:'Activity', budget:'Budget',
   balances:'Balances', runway:'Runway', mortgage:'Mortgage', settings:'Settings'
 };
 
@@ -693,8 +694,11 @@ async function loadDashboard() {
 
     const heroCard = `
       <div class="hero-card">
-        <div class="hero-label">Net Worth</div>
-        <div class="hero-value">${fmt(netWorth, 0)}</div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div class="hero-label">Net Worth</div>
+          <button onclick="toggleNWBlur()" id="nwBlurBtn" style="background:none;border:none;cursor:pointer;font-size:1.1rem;opacity:0.6;padding:4px;-webkit-tap-highlight-color:transparent" title="Hide/show">👁</button>
+        </div>
+        <div class="hero-value" id="nwHeroVal">${fmt(netWorth, 0)}</div>
         ${asOf ? `<div class="hero-sub">as of ${asOf}</div>` : ''}
       </div>
       <div class="card" style="margin-bottom:14px">
@@ -704,8 +708,9 @@ async function loadDashboard() {
 
     const viewToggle = `
       <div class="view-toggle">
-        <button class="view-btn${dashView === 'month' ? ' active' : ''}" onclick="setDashView('month')">Month</button>
-        <button class="view-btn${dashView === 'year'  ? ' active' : ''}" onclick="setDashView('year')">Year</button>
+        <button class="view-btn${dashView === 'month'  ? ' active' : ''}" onclick="setDashView('month')">Month</button>
+        <button class="view-btn${dashView === 'year'   ? ' active' : ''}" onclick="setDashView('year')">Year</button>
+        <button class="view-btn${dashView === 'wealth' ? ' active' : ''}" onclick="setDashView('wealth')">📈 Wealth</button>
       </div>`;
 
     if (dashView === 'month') {
@@ -718,6 +723,9 @@ async function loadDashboard() {
 
       const cashIncome = txIncRaw
         .filter(r => r.category !== 'Valuacion' && r.sub_category !== 'Intereses')
+        .reduce((s, r) => s + +r.amount, 0);
+      const valIncome = txIncRaw
+        .filter(r => r.category === 'Valuacion' || r.sub_category === 'Intereses')
         .reduce((s, r) => s + +r.amount, 0);
 
       const txExpNonMtg     = txExpRaw.filter(r => !MTG_CATS.has(r.category));
@@ -782,8 +790,8 @@ async function loadDashboard() {
             <div class="kpi-value green" style="font-size:0.82rem">${fmt(cashIncome,0)}</div>
           </div>
           <div class="kpi" style="padding:10px 4px">
-            <div class="kpi-label" style="font-size:0.55rem"># Tx</div>
-            <div class="kpi-value" style="font-size:0.82rem">${numTx}</div>
+            <div class="kpi-label" style="font-size:0.55rem">Val & Interest</div>
+            <div class="kpi-value" style="font-size:0.82rem;color:#06b6d4">${valIncome ? fmt(valIncome,0) : '—'}</div>
           </div>
           <div class="kpi" style="padding:10px 4px">
             <div class="kpi-label" style="font-size:0.55rem">vs Budget</div>
@@ -966,7 +974,10 @@ async function loadDashboard() {
           : statsBar + top10Card + catSummaryCard + otrosCard + dailyCard}`;
 
       if (hasData) renderDailyChart(mDays, dailyData, cumDailyData, daysElapsed);
+      applyNWBlur();
 
+    } else if (dashView === 'wealth') {
+      await loadWealthView(el, heroCard, viewToggle, acctMap);
     } else {
       const [txInc, txExp] = await Promise.all([
         dbGet('transactions', `?type=eq.Income&month_year=like.*-${yr}&select=amount,month_year,category,sub_category`),
@@ -1161,11 +1172,172 @@ async function loadDashboard() {
         renderNWChart(activeMonths, nwByMonth);
         renderCumChart(activeMonths, cumIncData, cumExpData);
       }
+      applyNWBlur();
     }
 
   } catch(e) {
     el.innerHTML = `<div class="placeholder"><div class="icon">⚠️</div><h2>Error</h2><p>${e.message}</p></div>`;
   }
+}
+
+// ── Hide/blur net worth ────────────────────────────────────────────────────
+let nwBlurred = localStorage.getItem('nw_blurred') === '1';
+function toggleNWBlur() {
+  nwBlurred = !nwBlurred;
+  localStorage.setItem('nw_blurred', nwBlurred ? '1' : '0');
+  applyNWBlur();
+}
+function applyNWBlur() {
+  const el = document.getElementById('nwHeroVal');
+  const btn = document.getElementById('nwBlurBtn');
+  if (!el) return;
+  el.style.filter  = nwBlurred ? 'blur(8px)' : '';
+  el.style.userSelect = nwBlurred ? 'none' : '';
+  if (btn) btn.style.opacity = nwBlurred ? '1' : '0.6';
+}
+
+// ── Wealth view ────────────────────────────────────────────────────────────
+let wealthChart1 = null, wealthChart2 = null;
+
+async function loadWealthView(el, heroCard, viewToggle, acctMap) {
+  // Investment settings from app_settings
+  const settings = await dbGet('app_settings', '?key=in.(finax_cost_basis,finax_return_pct,investment_snapshots)').catch(() => []);
+  const sMap = {};
+  settings.forEach(s => { sMap[s.key] = s.value; });
+
+  const finaxVal      = acctMap['ETFMatic'] || 0;
+  const t212Val       = acctMap['Trade212']  || 0;
+  const finaxCost     = parseFloat(sMap['finax_cost_basis'] || '57300');
+  const finaxRetPct   = parseFloat(sMap['finax_return_pct'] || '60.51');
+  const finaxGain     = finaxVal - finaxCost;
+  const t212Daily     = t212Val > 0 ? (t212Val * 0.03 / 365) : 0;
+  const snapshots     = JSON.parse(sMap['investment_snapshots'] || '[]');
+
+  // Section 1 — cards
+  const cardsHTML = `
+    <div class="kpi-row" style="grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:14px">
+      <div class="card" style="padding:14px">
+        <div style="font-size:0.62rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#06b6d4;margin-bottom:6px">Savings · Trade212</div>
+        <div style="font-size:1.3rem;font-weight:800;font-variant-numeric:tabular-nums">${fmt(t212Val,0)}</div>
+        <div style="font-size:0.72rem;color:var(--muted);margin-top:4px">~${fmt(t212Daily,2)}/day · 3% p.a.</div>
+      </div>
+      <div class="card" style="padding:14px">
+        <div style="font-size:0.62rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--green);margin-bottom:6px">Investments · Finax</div>
+        <div style="font-size:1.3rem;font-weight:800;font-variant-numeric:tabular-nums">${fmt(finaxVal,0)}</div>
+        <div style="font-size:0.72rem;color:var(--muted);margin-top:2px">Cost ${fmt(finaxCost,0)} · <span style="color:var(--green);font-weight:700">+${fmt(finaxGain,0)} (+${finaxRetPct.toFixed(1)}%)</span></div>
+        <button onclick="editInvestmentSettings()" style="margin-top:6px;font-size:0.65rem;color:var(--muted);background:none;border:none;cursor:pointer;padding:0;text-decoration:underline">✏️ update</button>
+      </div>
+    </div>`;
+
+  // Section 2 — Finax value chart (from snapshots)
+  const snap = snapshots.filter(s => s.finax);
+  const snapDates  = snap.map(s => s.date);
+  const snapValues = snap.map(s => s.finax);
+  const snapCosts  = snap.map(s => s.cost || finaxCost);
+  // Always include today
+  const today = new Date().toISOString().slice(0,10);
+  if (!snapDates.includes(today)) { snapDates.push(today); snapValues.push(finaxVal); snapCosts.push(finaxCost); }
+
+  const chartHTML = `
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-title">Finax Portfolio Value</div>
+      <div style="font-size:0.72rem;color:var(--muted);margin-bottom:8px;padding:0 2px">${snap.length < 2 ? 'Chart builds as you import CSVs — check back next month.' : ''}</div>
+      <div style="position:relative;height:180px"><canvas id="wealthChart1"></canvas></div>
+    </div>`;
+
+  // Section 3 — Monthly passive income
+  const yr = yy(activeYear);
+  const passiveTx = await dbGet('transactions',
+    `?type=eq.Income&month_year=like.*-${yr}&category=in.(Valuacion,Interest)&select=amount,month_year`).catch(() => []);
+  const passiveTx2 = await dbGet('transactions',
+    `?type=eq.Income&month_year=like.*-${yr}&sub_category=eq.Intereses&select=amount,month_year`).catch(() => []);
+  const allPassive = [...passiveTx, ...passiveTx2];
+  const passiveByMonth = {};
+  MONTHS_ES.forEach(m => { passiveByMonth[`${m}-${yr}`] = 0; });
+  allPassive.forEach(r => { if (r.month_year in passiveByMonth) passiveByMonth[r.month_year] += +r.amount; });
+  const passiveMonths = MONTHS_ES.map(m => `${m}-${yr}`);
+  const passiveLabels = MONTHS_ES;
+  const passiveData   = passiveMonths.map(mk => passiveByMonth[mk]);
+
+  const passiveHTML = `
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-title">Monthly Passive Income · ${activeYear}</div>
+      <div style="position:relative;height:180px"><canvas id="wealthChart2"></canvas></div>
+    </div>`;
+
+  el.innerHTML = heroCard + viewToggle + cardsHTML + chartHTML + passiveHTML;
+  applyNWBlur();
+
+  // Render chart 1 — Finax value vs cost
+  if (wealthChart1) { wealthChart1.destroy(); wealthChart1 = null; }
+  const c1 = document.getElementById('wealthChart1');
+  if (c1 && snapDates.length >= 1) {
+    wealthChart1 = new Chart(c1, {
+      type: 'line',
+      data: {
+        labels: snapDates,
+        datasets: [
+          { label:'Portfolio Value', data: snapValues, borderColor:'#3b82f6', backgroundColor:'rgba(59,130,246,0.08)', fill:true, tension:0.3, pointRadius:3 },
+          { label:'Net Deposits',    data: snapCosts,  borderColor:'#f59e0b', borderDash:[5,4], backgroundColor:'transparent', fill:false, tension:0.1, pointRadius:2 }
+        ]
+      },
+      options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'bottom', labels:{ font:{size:11}, boxWidth:12 }}},
+        scales:{ y:{ ticks:{ callback: v => '€'+Math.round(v/1000)+'k' }, grid:{ color:'rgba(0,0,0,0.05)' }}, x:{ ticks:{ font:{size:10}, maxTicksLimit:6 }}}}
+    });
+  }
+
+  // Render chart 2 — Monthly passive income
+  if (wealthChart2) { wealthChart2.destroy(); wealthChart2 = null; }
+  const c2 = document.getElementById('wealthChart2');
+  if (c2) {
+    wealthChart2 = new Chart(c2, {
+      type: 'bar',
+      data: {
+        labels: passiveLabels,
+        datasets: [{ label:'Passive Income', data: passiveData, backgroundColor:'rgba(6,182,212,0.7)', borderColor:'#06b6d4', borderWidth:1, borderRadius:4 }]
+      },
+      options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false }},
+        scales:{ y:{ ticks:{ callback: v => '€'+v }, grid:{ color:'rgba(0,0,0,0.05)' }}, x:{ ticks:{ font:{size:10} }}}}
+    });
+  }
+}
+
+function editInvestmentSettings() {
+  const cost = prompt('Finax net deposits (cost basis) in €:', localStorage.getItem('finax_cost_basis') || '57300');
+  if (cost === null) return;
+  const ret  = prompt('Finax simple return % (from Finax app):', localStorage.getItem('finax_return_pct') || '60.51');
+  if (ret === null) return;
+  localStorage.setItem('finax_cost_basis', cost);
+  localStorage.setItem('finax_return_pct', ret);
+  dbPost('app_settings', [
+    { key:'finax_cost_basis', value: cost },
+    { key:'finax_return_pct', value: ret }
+  ], true).catch(() => {});
+  loadDashboard();
+}
+
+// Snapshot investment balances after each import
+async function snapshotInvestmentBalances() {
+  try {
+    const accounts = await dbGet('accounts', '?select=name,balance');
+    const aMap = {};
+    accounts.forEach(a => { aMap[a.name] = +a.balance; });
+    const finaxVal = aMap['ETFMatic'] || 0;
+    const t212Val  = aMap['Trade212']  || 0;
+    if (!finaxVal && !t212Val) return;
+
+    const settings = await dbGet('app_settings', '?key=eq.investment_snapshots').catch(() => []);
+    const existing = JSON.parse(settings[0]?.value || '[]');
+    const today    = new Date().toISOString().slice(0,10);
+    const finaxCost = parseFloat(localStorage.getItem('finax_cost_basis') || '57300');
+
+    // Only add if date changed or values changed
+    const last = existing[existing.length - 1];
+    if (last && last.date === today && last.finax === finaxVal && last.t212 === t212Val) return;
+
+    existing.push({ date: today, finax: finaxVal, t212: t212Val, cost: finaxCost });
+    await dbPost('app_settings', [{ key:'investment_snapshots', value: JSON.stringify(existing) }], true);
+  } catch(e) { console.warn('Snapshot failed:', e); }
 }
 
 function buildCatBars(topCats) {
@@ -1462,7 +1634,10 @@ async function loadTransactions() {
     if (txAcctF)        txs = txs.filter(r => r.from_account === txAcctF);
     if (txCatF)         txs = txs.filter(r => r.category === txCatF && r.type !== 'Transfer');
 
-    const income  = allTxs.filter(r => r.type === 'Income').reduce((s, r) => s + +r.amount, 0);
+    const incomeAll  = allTxs.filter(r => r.type === 'Income');
+    const income     = incomeAll.reduce((s, r) => s + +r.amount, 0);
+    const cashIncomeTx = incomeAll.filter(r => r.category !== 'Valuacion' && r.sub_category !== 'Intereses').reduce((s, r) => s + +r.amount, 0);
+    const valIncomeTx  = incomeAll.filter(r => r.category === 'Valuacion' || r.sub_category === 'Intereses').reduce((s, r) => s + +r.amount, 0);
     const expense = allTxs.filter(r => r.type === 'Expense').reduce((s, r) => s + +r.amount, 0);
     const net     = income - expense;
 
@@ -1528,8 +1703,9 @@ async function loadTransactions() {
         <span style="font-weight:700;font-size:1rem">${MONTHS_FULL[txMonth]} ${txYear}</span>
         <button onclick="nextTxMonth()" style="width:36px;height:36px;border-radius:50%;border:1px solid var(--border);background:var(--card);font-size:1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent">→</button>
       </div>
-      <div class="kpi-row" style="margin-bottom:14px">
-        <div class="kpi"><div class="kpi-label">Income</div><div class="kpi-value green">${fmt(income,0)}</div></div>
+      <div class="kpi-row" style="margin-bottom:14px;grid-template-columns:repeat(4,1fr)">
+        <div class="kpi"><div class="kpi-label" style="font-size:0.6rem">Cash Income</div><div class="kpi-value green">${fmt(cashIncomeTx,0)}</div></div>
+        <div class="kpi"><div class="kpi-label" style="font-size:0.6rem">Val & Interest</div><div class="kpi-value" style="color:#06b6d4">${valIncomeTx ? fmt(valIncomeTx,0) : '—'}</div></div>
         <div class="kpi"><div class="kpi-label">Expenses</div><div class="kpi-value red">${fmt(expense,0)}</div></div>
         <div class="kpi"><div class="kpi-label">Net</div><div class="kpi-value ${net>=0?'green':'red'}">${fmt(net,0)}</div></div>
       </div>
@@ -2469,6 +2645,7 @@ async function importFromOneDrive() {
       await dbPost('transactions', newTx.slice(i, i+100));
     await updateAccountBalances(balances);
     await dbPost('import_log', { filename: info.name, row_count: newTx.length });
+    await snapshotInvestmentBalances();
     toast(`✅ ${newTx.length} new transactions imported`);
     latestEl.textContent = `Latest: ${info.name}`;
     loadImportLog();
@@ -2641,6 +2818,7 @@ async function confirmImport() {
       await dbPost('transactions', newTx.slice(i, i+100));
     await updateAccountBalances(balances);
     await dbPost('import_log', { filename, row_count: newTx.length });
+    await snapshotInvestmentBalances();
     toast(`✅ ${newTx.length} transactions imported`);
     cancelImport();
     loadImportLog();
