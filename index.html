@@ -2338,17 +2338,22 @@ const MSAL_CONFIG = {
 const OD_SCOPES   = ['Files.Read'];
 const OD_FOLDER   = 'Finanzas/OneMoneyApp';
 let msalInstance  = null;
+let msalReady     = false;
 
-function getMSAL() {
-  if (!msalInstance) msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
+async function getMSAL() {
+  if (!msalInstance) {
+    msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
+    await msalInstance.initialize();
+    msalReady = true;
+  }
   return msalInstance;
 }
 
 async function getODToken() {
-  const app      = getMSAL();
-  const accounts = app.getAllAccounts();
-  if (accounts.length === 0) return null;
   try {
+    const app      = await getMSAL();
+    const accounts = app.getAllAccounts();
+    if (accounts.length === 0) return null;
     const res = await app.acquireTokenSilent({ scopes: OD_SCOPES, account: accounts[0] });
     return res.accessToken;
   } catch { return null; }
@@ -2359,14 +2364,21 @@ async function initOneDrive() {
   const connectBtn= document.getElementById('odConnectBtn');
   const importBtn = document.getElementById('odImportBtn');
   if (!statusEl) return;
-  const token = await getODToken();
-  if (token) {
-    const acc = getMSAL().getAllAccounts()[0];
-    statusEl.textContent = `Connected as ${acc.username}`;
-    importBtn.style.display = 'block';
-    connectBtn.style.display = 'none';
-    await refreshLatestFileName(token);
-  } else {
+  try {
+    const token = await getODToken();
+    if (token) {
+      const app = await getMSAL();
+      const acc = app.getAllAccounts()[0];
+      statusEl.textContent = `Connected · ${acc.username}`;
+      importBtn.style.display = 'block';
+      connectBtn.style.display = 'none';
+      await refreshLatestFileName(token);
+    } else {
+      statusEl.textContent = 'Not connected';
+      connectBtn.style.display = 'block';
+      importBtn.style.display = 'none';
+    }
+  } catch(e) {
     statusEl.textContent = 'Not connected';
     connectBtn.style.display = 'block';
     importBtn.style.display = 'none';
@@ -2375,7 +2387,7 @@ async function initOneDrive() {
 
 async function connectOneDrive() {
   try {
-    const app = getMSAL();
+    const app = await getMSAL();
     const res = await app.loginPopup({ scopes: OD_SCOPES });
     app.setActiveAccount(res.account);
     await initOneDrive();
