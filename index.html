@@ -977,7 +977,7 @@ async function loadDashboard() {
       applyNWBlur();
 
     } else if (dashView === 'wealth') {
-      await loadWealthView(el, heroCard, viewToggle, acctMap);
+      await loadWealthView(el, heroCard, viewToggle, acctMap, accounts);
     } else {
       const [txInc, txExp] = await Promise.all([
         dbGet('transactions', `?type=eq.Income&month_year=like.*-${yr}&select=amount,month_year,category,sub_category`),
@@ -1200,11 +1200,15 @@ function applyNWBlur() {
 // ── Wealth view ────────────────────────────────────────────────────────────
 let wealthChart1 = null, wealthChart2 = null;
 
-async function loadWealthView(el, heroCard, viewToggle, acctMap) {
+async function loadWealthView(el, heroCard, viewToggle, acctMap, accounts) {
   // Investment settings
   const settings = await dbGet('app_settings', '?key=in.(finax_cost_basis,finax_return_pct)').catch(() => []);
   const sMap = {};
   settings.forEach(s => { sMap[s.key] = s.value; });
+
+  // Account info (balance + last_updated)
+  const acctInfoMap = {};
+  (accounts || []).forEach(a => { acctInfoMap[a.name] = a; });
 
   const finaxVal    = acctMap['ETFMatic'] || 0;
   const t212Val     = acctMap['Trade212']  || 0;
@@ -1212,19 +1216,23 @@ async function loadWealthView(el, heroCard, viewToggle, acctMap) {
   const finaxRetPct = parseFloat(sMap['finax_return_pct'] || '60.51');
   const finaxGain   = finaxVal - finaxCost;
   const t212Daily   = t212Val > 0 ? (t212Val * 0.03 / 365) : 0;
+  const finaxAsOf   = acctInfoMap['ETFMatic']?.last_updated || null;
+  const t212AsOf    = acctInfoMap['Trade212']?.last_updated  || null;
 
   // Section 1 — cards
   const cardsHTML = `
     <div class="kpi-row" style="grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:14px">
       <div class="card" style="padding:14px">
         <div style="font-size:0.62rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#06b6d4;margin-bottom:6px">Savings · Trade212</div>
-        <div style="font-size:1.3rem;font-weight:800;font-variant-numeric:tabular-nums">${fmt(t212Val,0)}</div>
-        <div style="font-size:0.72rem;color:var(--muted);margin-top:4px">~${fmt(t212Daily,2)}/day · 3% p.a.</div>
+        <div class="nw-blur-val" style="font-size:1.3rem;font-weight:800;font-variant-numeric:tabular-nums">${fmt(t212Val,0)}</div>
+        <div class="nw-blur-val" style="font-size:0.72rem;color:var(--muted);margin-top:4px">~${fmt(t212Daily,2)}/day · 3% p.a.</div>
+        ${t212AsOf ? `<div style="font-size:0.65rem;color:var(--muted);margin-top:3px">as of ${t212AsOf}</div>` : ''}
       </div>
       <div class="card" style="padding:14px">
         <div style="font-size:0.62rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--green);margin-bottom:6px">Investments · Finax</div>
-        <div style="font-size:1.3rem;font-weight:800;font-variant-numeric:tabular-nums">${fmt(finaxVal,0)}</div>
-        <div style="font-size:0.72rem;color:var(--muted);margin-top:2px">Cost ${fmt(finaxCost,0)} · <span style="color:var(--green);font-weight:700">+${fmt(finaxGain,0)} (+${finaxRetPct.toFixed(1)}%)</span></div>
+        <div class="nw-blur-val" style="font-size:1.3rem;font-weight:800;font-variant-numeric:tabular-nums">${fmt(finaxVal,0)}</div>
+        <div class="nw-blur-val" style="font-size:0.72rem;color:var(--muted);margin-top:2px">Cost ${fmt(finaxCost,0)} · <span style="color:var(--green);font-weight:700">+${fmt(finaxGain,0)} (+${finaxRetPct.toFixed(1)}%)</span></div>
+        ${finaxAsOf ? `<div style="font-size:0.65rem;color:var(--muted);margin-top:3px">as of ${finaxAsOf}</div>` : ''}
         <button onclick="editInvestmentSettings()" style="margin-top:6px;font-size:0.65rem;color:var(--muted);background:none;border:none;cursor:pointer;padding:0;text-decoration:underline">✏️ update</button>
       </div>
     </div>`;
@@ -1271,7 +1279,7 @@ async function loadWealthView(el, heroCard, viewToggle, acctMap) {
       <div style="position:relative;height:200px"><canvas id="wealthChart1"></canvas></div>
     </div>`;
 
-  // Section 3 — Monthly passive income (all available history, last 24 months)
+  // Section 3 — Monthly passive income (full range with zeros for empty months)
   const [passiveVal, passiveInt] = await Promise.all([
     dbGet('transactions', '?type=eq.Income&category=eq.Valuacion&select=amount,month_year'),
     dbGet('transactions', '?type=eq.Income&sub_category=eq.Intereses&select=amount,month_year')
@@ -1280,8 +1288,23 @@ async function loadWealthView(el, heroCard, viewToggle, acctMap) {
   [...passiveVal, ...passiveInt].forEach(r => {
     passiveByMonth[r.month_year] = (passiveByMonth[r.month_year] || 0) + +r.amount;
   });
-  const passiveMonths = Object.keys(passiveByMonth).sort(mkSort).slice(-24);
-  const passiveData   = passiveMonths.map(mk => passiveByMonth[mk]);
+  // Build full month range from earliest data to current month (zeros for missing)
+  const passiveNow = new Date();
+  const passiveEndMk = `${MONTHS_ES[passiveNow.getMonth()]}-${String(passiveNow.getFullYear()).slice(2)}`;
+  const rawPassiveMonths = Object.keys(passiveByMonth).sort(mkSort);
+  const passiveStartMk  = rawPassiveMonths[0] || passiveEndMk;
+  const passiveMonths   = [];
+  {
+    const [sm, sy] = passiveStartMk.split('-');
+    let mi = MONTHS_ES.indexOf(sm), yi = 2000 + parseInt(sy);
+    const [em, ey] = passiveEndMk.split('-');
+    const emi = MONTHS_ES.indexOf(em), eyi = 2000 + parseInt(ey);
+    while (yi < eyi || (yi === eyi && mi <= emi)) {
+      passiveMonths.push(`${MONTHS_ES[mi]}-${String(yi).slice(2)}`);
+      mi++; if (mi >= 12) { mi = 0; yi++; }
+    }
+  }
+  const passiveData = passiveMonths.map(mk => passiveByMonth[mk] || 0);
 
   const passiveHTML = `
     <div class="card" style="margin-bottom:14px">
@@ -1551,7 +1574,7 @@ async function loadBalances() {
               ${a.last_updated || 'never synced'}${isManual ? ' · manual' : ''}
             </div>
           </div>
-          <div style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${isNeg?'var(--red)':'var(--text)'}">${fmt(bal,2)}</div>
+          <div class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${isNeg?'var(--red)':'var(--text)'}">${fmt(bal,2)}</div>
         </div>`;
       }).join('');
 
@@ -1559,7 +1582,7 @@ async function loadBalances() {
         <div class="card" style="padding:0;margin-bottom:12px;overflow:hidden">
           <div style="display:flex;align-items:center;justify-content:space-between;padding:11px 16px;background:${group.color}18;border-bottom:1px solid ${group.color}33">
             <span style="font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:${group.color}">${group.label}</span>
-            <span style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${grpTotal<0?'var(--red)':group.color}">${fmt(grpTotal,2)}</span>
+            <span class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${grpTotal<0?'var(--red)':group.color}">${fmt(grpTotal,2)}</span>
           </div>
           ${rows}
         </div>`;
@@ -1576,17 +1599,18 @@ async function loadBalances() {
         ${otherAccts.map(a => `
           <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border)">
             <div style="font-size:0.85rem;font-weight:500">${a.name}</div>
-            <div style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums">${fmt(+a.balance,2)}</div>
+            <div class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums">${fmt(+a.balance,2)}</div>
           </div>`).join('')}
       </div>` : '';
 
     el.innerHTML = `
       <div class="hero-card">
         <div class="hero-label">Net Worth</div>
-        <div class="hero-value">${fmt(netWorth, 0)}</div>
+        <div class="hero-value nw-blur-val">${fmt(netWorth, 0)}</div>
         ${asOf ? `<div class="hero-sub">last synced ${asOf} · manual accounts updated in Settings</div>` : ''}
       </div>
       ${groupCards}${otherCards}`;
+    applyNWBlur();
   } catch(e) {
     el.innerHTML = `<div class="placeholder"><div class="icon">⚠️</div><h2>Error</h2><p>${e.message}</p></div>`;
   }
