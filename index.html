@@ -1885,23 +1885,31 @@ async function editBudget(category) {
     if (input === null) return;
     const num = parseFloat(input.replace(',', '.'));
     if (isNaN(num) || num < 0) { toast('Invalid amount'); return; }
-    await dbPost('budget_targets', [{ year: activeYear, category, monthly_budget: num }], true);
-    toast(`✅ Budget updated`);
+    if (existing.length) {
+      await dbPatch('budget_targets', `?year=eq.${activeYear}&category=eq.${encodeURIComponent(category)}`, { monthly_budget: num });
+    } else {
+      await dbPost('budget_targets', [{ year: activeYear, category, monthly_budget: num }]);
+    }
+    toast('Budget updated ✓');
     loadBudget();
   } catch(e) { toast('Error: ' + e.message); }
 }
 
 async function editGroupBudget(groupLabel) {
   try {
-    const grpKey  = `_grp_${groupLabel}`;
+    const grpKey   = `_grp_${groupLabel}`;
     const existing = await dbGet('budget_targets', `?year=eq.${activeYear}&category=eq.${encodeURIComponent(grpKey)}&select=monthly_budget`);
     const current  = existing.length ? existing[0].monthly_budget : 0;
     const input    = window.prompt(`Monthly envelope for "${groupLabel}" group (${activeYear}):`, current);
     if (input === null) return;
     const num = parseFloat(input.replace(',', '.'));
     if (isNaN(num) || num < 0) { toast('Invalid amount'); return; }
-    await dbPost('budget_targets', [{ year: activeYear, category: grpKey, monthly_budget: num }], true);
-    toast(`✅ Envelope updated`);
+    if (existing.length) {
+      await dbPatch('budget_targets', `?year=eq.${activeYear}&category=eq.${encodeURIComponent(grpKey)}`, { monthly_budget: num });
+    } else {
+      await dbPost('budget_targets', [{ year: activeYear, category: grpKey, monthly_budget: num }]);
+    }
+    toast('Envelope updated ✓');
     loadBudget();
   } catch(e) { toast('Error: ' + e.message); }
 }
