@@ -659,6 +659,7 @@ let nwChart      = null;
 let cumChart     = null;
 let dailyChart   = null;
 let runwayChart  = null;
+let rwActualChart = null;
 
 function setDashView(v) { dashView = v; loadDashboard(); }
 function prevMonth() { if (dashMonth > 0)  { dashMonth--; loadDashboard(); } }
@@ -1267,9 +1268,29 @@ async function loadWealthView(el, heroCard, viewToggle, acctMap, accounts) {
     cumDep += (netDepByMonth[mk] || 0);
   }
 
-  const chartMonths = [...histMonths, currentMk];
-  const chartLabels = chartMonths.map(mk => mk);
-  const chartValues = chartMonths.map(mk => balByMonth[mk] || 0);
+  // Generate full month range (forward-fill gaps so every month-end is shown)
+  const allMks = [];
+  if (histMonths.length > 0) {
+    const [sm, sy] = histMonths[0].split('-');
+    let mi = MONTHS_ES.indexOf(sm), yi = 2000 + parseInt(sy);
+    const [em, ey] = currentMk.split('-');
+    const emi = MONTHS_ES.indexOf(em), eyi = 2000 + parseInt(ey);
+    while (yi < eyi || (yi === eyi && mi <= emi)) {
+      allMks.push(`${MONTHS_ES[mi]}-${String(yi).slice(2)}`);
+      mi++; if (mi >= 12) { mi = 0; yi++; }
+    }
+  } else {
+    allMks.push(currentMk);
+  }
+  // Carry last known balance forward for months without a data point
+  const chartMonths = allMks;
+  const chartLabels = chartMonths;
+  const chartValues = [];
+  let lastKnownBal = 0;
+  for (const mk of chartMonths) {
+    if (balByMonth[mk] !== undefined) lastKnownBal = balByMonth[mk];
+    chartValues.push(lastKnownBal);
+  }
   const hasHistory  = histMonths.length > 0;
 
   const chartHTML = `
@@ -1882,19 +1903,17 @@ async function editGroupBudget(groupLabel) {
 
 // ── Runway ────────────────────────────────────────────────────────────────────
 async function saveRunwaySettings() {
-  const income      = parseFloat(document.getElementById('rw_income')?.value      || '0') || 0;
-  const incomeUntil = document.getElementById('rw_incomeUntil')?.value             || '';
-  const buffer      = parseFloat(document.getElementById('rw_buffer')?.value      || '15') || 15;
-  // Cache locally for speed
+  const income      = parseFloat(document.getElementById('rw_income')?.value  || '0') || 0;
+  const incomeUntil = document.getElementById('rw_incomeUntil')?.value         || '';
+  const target      = parseFloat(document.getElementById('rw_target')?.value  || '0') || 0;
   localStorage.setItem('rw_income',      income);
   localStorage.setItem('rw_incomeUntil', incomeUntil);
-  localStorage.setItem('rw_buffer',      buffer);
-  // Persist to Supabase so any device picks it up
+  localStorage.setItem('rw_target',      target);
   try {
     await dbPost('app_settings', [
       { key: 'rw_income',      value: String(income) },
       { key: 'rw_incomeUntil', value: incomeUntil },
-      { key: 'rw_buffer',      value: String(buffer) }
+      { key: 'rw_target',      value: String(target) }
     ], true);
   } catch(e) { console.warn('Settings sync failed:', e); }
   loadRunway();
@@ -1905,163 +1924,132 @@ async function loadRunway() {
   if (!el) return;
   el.innerHTML = '<div class="spinner"></div>';
   try {
-    // Persistent settings
-    const incomeAmt   = parseFloat(localStorage.getItem('rw_income')      || '0');
-    const incomeUntil = localStorage.getItem('rw_incomeUntil')             || '';
-    const bufferPct   = parseFloat(localStorage.getItem('rw_buffer')      || '15') / 100;
-
-    // How many months of income remain from today
-    const now = new Date();
-    let incomeMos = 0;
-    if (incomeUntil) {
-      const [uy, um] = incomeUntil.split('-').map(Number); // um is 1-indexed
-      incomeMos = Math.max(0, (uy * 12 + um) - (now.getFullYear() * 12 + now.getMonth() + 1));
-    }
-
-    const todayMk = monthKey(now.getMonth(), now.getFullYear());
+    const now      = new Date();
+    const todayMk  = monthKey(now.getMonth(), now.getFullYear());
     const minMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
 
-    const [accounts, txExp, budgets, sbSettings] = await Promise.all([
+    const [accounts, txExp, txInc, sbSettings] = await Promise.all([
       dbGet('accounts', '?select=name,balance'),
       dbGet('transactions', '?type=eq.Expense&select=amount,month_year,category'),
-      dbGet('budget_targets', `?year=eq.${activeYear}&select=category,monthly_budget`),
-      dbGet('app_settings', '?key=in.(rw_income,rw_incomeUntil,rw_buffer)').catch(() => [])
+      dbGet('transactions', '?type=eq.Income&select=amount,month_year,category'),
+      dbGet('app_settings', '?key=in.(rw_income,rw_incomeUntil,rw_target)').catch(() => [])
     ]);
 
-    // Merge Supabase settings over localStorage (Supabase wins — cross-device source of truth)
+    // Supabase settings win (cross-device source of truth)
     const sMap = {};
     sbSettings.forEach(s => { sMap[s.key] = s.value; });
     if (sMap['rw_income'])      localStorage.setItem('rw_income',      sMap['rw_income']);
     if (sMap['rw_incomeUntil']) localStorage.setItem('rw_incomeUntil', sMap['rw_incomeUntil']);
-    if (sMap['rw_buffer'])      localStorage.setItem('rw_buffer',      sMap['rw_buffer']);
+    if (sMap['rw_target'])      localStorage.setItem('rw_target',      sMap['rw_target']);
+
+    const incomeAmt   = parseFloat(localStorage.getItem('rw_income')  || '0');
+    const incomeUntil = localStorage.getItem('rw_incomeUntil')         || '';
+    const target      = parseFloat(localStorage.getItem('rw_target')  || '0');
+
+    // Months of income remaining
+    let incomeMos = 0;
+    if (incomeUntil) {
+      const [uy, um] = incomeUntil.split('-').map(Number);
+      incomeMos = Math.max(0, (uy * 12 + um) - (now.getFullYear() * 12 + now.getMonth() + 1));
+    }
 
     const acctMapR = {};
     accounts.forEach(a => { acctMapR[a.name] = +a.balance; });
 
-    const bMap = {};
-    budgets.forEach(b => { if (!b.category.startsWith('_grp_')) bMap[b.category] = +b.monthly_budget; });
-
-    // ── Net liquid (CC accounts net naturally with negative balances) ──
+    // ── Liquid pool ───────────────────────────────────────────────────────────
     const POOL_ACCTS = ['Trade212','Debito ING','Debit ABN','Apartados ING','Apartados ABN','TDC - ING','AMEX-TDC'];
     const netLiquid  = POOL_ACCTS.reduce((s, n) => s + (acctMapR[n] || 0), 0);
 
-    // ── Structured burn ──────────────────────────────────────────────────────
-    const MTG_R = new Set(['Mortgage Principal','Mortgage Interest']);
-
-    // Mortgage: use the most recent complete month's payment (current rate, no avg distortion)
-    const mtgTxs     = txExp.filter(r => MTG_R.has(r.category) && r.month_year !== todayMk);
-    const mtgByMonth = {};
-    mtgTxs.forEach(r => { mtgByMonth[r.month_year] = (mtgByMonth[r.month_year] || 0) + +r.amount; });
-    const allMtgMks  = Object.keys(mtgByMonth).sort(mkSort);
-    const lastMtgMk  = allMtgMks[allMtgMks.length - 1] || null;
-    const mtgMonthly = lastMtgMk ? mtgByMonth[lastMtgMk] : 0;
-
-    // Category × month matrix (non-mortgage, complete months only)
-    const catByMonth = {};
-    txExp.forEach(r => {
-      if (MTG_R.has(r.category) || r.month_year === todayMk) return;
-      if (!catByMonth[r.category]) catByMonth[r.category] = {};
-      catByMonth[r.category][r.month_year] = (catByMonth[r.category][r.month_year] || 0) + +r.amount;
-    });
-
-    // Last 3 complete months (for variable avg)
+    // ── Recent pace (last 3 complete months: avg expenses − avg cash income) ──
     const completeMks = [...new Set(
       txExp.filter(r => r.month_year !== todayMk).map(r => r.month_year)
     )].sort(mkSort).slice(-3);
 
-    // Per-category outlier-clamped average
-    const catAvg = {};
-    Object.keys(catByMonth).forEach(cat => {
-      const vals   = completeMks.map(mk => catByMonth[cat]?.[mk] || 0);
-      const sorted = [...vals].sort((a, b) => b - a);
-      const clamped = (sorted.length >= 2 && sorted[1] > 0 && sorted[0] > sorted[1] * 2.5)
-        ? vals.map(v => v === sorted[0] ? sorted[1] : v)
-        : vals;
-      catAvg[cat] = clamped.reduce((s, v) => s + v, 0) / Math.max(completeMks.length, 1);
-    });
+    const expByMonth = {}, cashIncByMonth = {};
+    txExp.forEach(r => { expByMonth[r.month_year] = (expByMonth[r.month_year] || 0) + +r.amount; });
+    txInc.filter(r => r.category !== 'Valuacion')
+         .forEach(r => { cashIncByMonth[r.month_year] = (cashIncByMonth[r.month_year] || 0) + +r.amount; });
 
-    // Fixed cats: budget target is authoritative; fallback to history
-    const fixedCatSet = new Set(CAT_GROUPS.find(g => g.label === 'Fixed')?.cats || []);
-    const fixedDetail = []; // for transparency display
-    let fixedCatBurn = 0, varBurn = 0;
+    const recentNetBurn = completeMks.length > 0
+      ? completeMks.reduce((s, mk) => s + (expByMonth[mk] || 0) - (cashIncByMonth[mk] || 0), 0) / completeMks.length
+      : null;
 
-    fixedCatSet.forEach(cat => {
-      const budgeted = bMap[cat] || 0;
-      const hist     = catAvg[cat] || 0;
-      const used     = budgeted || hist;
-      if (used > 0) {
-        fixedCatBurn += used;
-        fixedDetail.push({ cat, amt: used, fromBudget: !!budgeted });
-      }
-    });
-    // Mortgage is always fixed — use last known payment
-    if (mtgMonthly > 0) fixedDetail.push({ cat: `Mortgage (${lastMtgMk})`, amt: mtgMonthly, fromBudget: false });
-    const fixedBurn = fixedCatBurn + mtgMonthly;
-
-    Object.keys(catAvg).forEach(cat => {
-      if (!fixedCatSet.has(cat)) varBurn += catAvg[cat];
-    });
-
-    const varBurnBuffered = varBurn * (1 + bufferPct);
-    const structuredBurn  = fixedBurn + varBurnBuffered;
-
-    // ── Runway numbers (two-phase: income period → bare burn) ────────────────
-    const effectiveBurn = Math.max(0, structuredBurn - incomeAmt);
-    const runwayStress  = structuredBurn > 0 ? netLiquid / structuredBurn : null;
-
-    let runway = null;
-    if (structuredBurn > 0) {
+    // ── Runway at target ─────────────────────────────────────────────────────
+    const effectiveBurn = Math.max(0, target - incomeAmt);
+    let runwayTarget = null;
+    if (target > 0) {
       if (incomeAmt <= 0 || incomeMos <= 0) {
-        // No income configured: simple
-        runway = netLiquid / structuredBurn;
+        runwayTarget = target > 0 ? netLiquid / target : null;
       } else {
-        // Phase 1: burn reduced by income for incomeMos months
-        const balAfterIncome = netLiquid - effectiveBurn * incomeMos;
-        if (balAfterIncome <= 0) {
-          // Runs out before income ends
-          runway = effectiveBurn > 0 ? netLiquid / effectiveBurn : incomeMos;
-        } else {
-          // Phase 2: full burn after income stops
-          runway = incomeMos + balAfterIncome / structuredBurn;
-        }
+        const balAfter = netLiquid - effectiveBurn * incomeMos;
+        runwayTarget = balAfter <= 0
+          ? (effectiveBurn > 0 ? netLiquid / effectiveBurn : incomeMos)
+          : incomeMos + balAfter / target;
       }
     }
-    const heroColor     = runway === null ? 'var(--accent)'
-                        : runway < 3 ? '#dc2626' : runway < 6 ? '#d97706' : 'var(--accent)';
 
-    // ── "Until" label for hero sub ───────────────────────────────────────────
-    const runwayEndDate = runway !== null ? (() => {
-      const d = new Date(now.getFullYear(), now.getMonth() + Math.floor(runway), 1);
+    // ── Runway at recent pace ─────────────────────────────────────────────────
+    const runwayRecent = recentNetBurn > 0 ? netLiquid / recentNetBurn : null;
+
+    const heroColor = (runwayTarget ?? runwayRecent ?? 99) < 3 ? '#dc2626'
+                    : (runwayTarget ?? runwayRecent ?? 99) < 6 ? '#d97706' : 'var(--accent)';
+
+    const fmtRunway = (r) => r !== null ? r.toFixed(1) + ' mo' : '—';
+    const runwayEndDate = (r) => {
+      if (r === null) return null;
+      const d = new Date(now.getFullYear(), now.getMonth() + Math.floor(r), 1);
       return MONTHS_ES[d.getMonth()] + '-' + String(d.getFullYear()).slice(2);
-    })() : null;
+    };
 
-    // Fixed costs detail rows
-    const fixedDetailHTML = fixedDetail.map(r => `
-      <div style="display:flex;justify-content:space-between;padding:4px 16px">
-        <span style="font-size:0.75rem;color:var(--muted)">${r.cat}${r.fromBudget ? '' : ' <span style="font-size:0.62rem;opacity:0.6">(hist)</span>'}</span>
-        <span style="font-size:0.75rem;font-variant-numeric:tabular-nums">${fmt(r.amt,0)}</span>
-      </div>`).join('');
+    // ── Expected vs Actual table data (all complete months) ───────────────────
+    const allCompleteMks = [...new Set(
+      txExp.filter(r => r.month_year !== todayMk).map(r => r.month_year)
+    )].sort(mkSort);
+
+    const tableRows = allCompleteMks.map(mk => {
+      const actual   = expByMonth[mk] || 0;
+      const variance = target > 0 ? actual - target : null;
+      const vColor   = variance === null ? '' : variance > 0 ? 'var(--red)' : 'var(--green)';
+      const TD       = 'padding:7px 10px;font-size:0.8rem;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums';
+      return `<tr>
+        <td style="${TD};font-weight:500">${mk}</td>
+        <td style="${TD};text-align:right;color:var(--muted)">${target > 0 ? fmt(target,0) : '—'}</td>
+        <td style="${TD};text-align:right;font-weight:600">${fmt(actual,0)}</td>
+        <td style="${TD};text-align:right;font-weight:700;color:${vColor}">${variance !== null ? (variance > 0 ? '+' : '') + fmt(variance,0) : '—'}</td>
+      </tr>`;
+    }).reverse().join(''); // newest first
 
     el.innerHTML = `
       <div class="hero-card" style="background:${heroColor}">
-        <div class="hero-label">Cash Runway · incl. mortgage</div>
-        <div class="hero-value">${runway !== null ? runway.toFixed(1) + ' months' : '—'}</div>
-        <div class="hero-sub">${runway !== null
-          ? `until ~${runwayEndDate}${incomeAmt > 0 ? ` · stress (no income): ${runwayStress?.toFixed(1)} mo` : ''}`
-          : 'no burn data yet'}</div>
+        <div class="hero-label">Cash Runway</div>
+        <div class="hero-value">${fmtRunway(runwayTarget)}</div>
+        <div class="hero-sub">${runwayTarget !== null ? `until ~${runwayEndDate(runwayTarget)} · at target` : 'set a monthly target below'}</div>
       </div>
 
-      <div class="kpi-row" style="margin-bottom:14px">
-        <div class="kpi"><div class="kpi-label">Net Liquid</div><div class="kpi-value ${netLiquid>=0?'':'red'}">${fmt(netLiquid,0)}</div></div>
-        <div class="kpi"><div class="kpi-label">Fixed+Mtg</div><div class="kpi-value">${fmt(fixedBurn,0)}</div></div>
-        <div class="kpi"><div class="kpi-label">Var +${Math.round(bufferPct*100)}%</div><div class="kpi-value">${fmt(varBurnBuffered,0)}</div></div>
+      <div class="kpi-row" style="margin-bottom:14px;grid-template-columns:repeat(3,1fr)">
+        <div class="kpi">
+          <div class="kpi-label">Liquid</div>
+          <div class="kpi-value ${netLiquid>=0?'':'red'}">${fmt(netLiquid,0)}</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">At target</div>
+          <div class="kpi-value">${fmtRunway(runwayTarget)}</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">At recent pace</div>
+          <div class="kpi-value ${runwayRecent !== null && runwayTarget !== null && runwayRecent < runwayTarget ? 'red' : ''}">${fmtRunway(runwayRecent)}</div>
+        </div>
       </div>
 
-      <div class="card" style="padding:14px 16px;margin-bottom:4px">
-        <div style="font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:var(--muted);margin-bottom:10px">Expected Income</div>
+      <div class="card" style="padding:14px 16px;margin-bottom:14px">
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <div style="display:flex;align-items:center;gap:5px;flex:1;min-width:100px">
-            <span style="font-size:0.78rem;color:var(--muted);white-space:nowrap">€/mo</span>
+          <div style="display:flex;align-items:center;gap:5px;flex:1;min-width:110px">
+            <span style="font-size:0.78rem;color:var(--muted);white-space:nowrap">Target €/mo</span>
+            <input id="rw_target" type="number" value="${target || ''}" placeholder="5000"
+              style="flex:1;padding:6px 8px;border:1px solid var(--border);border-radius:6px;font-size:0.85rem;font-family:var(--font);background:var(--card);color:var(--text);min-width:0">
+          </div>
+          <div style="display:flex;align-items:center;gap:5px;flex:1;min-width:90px">
+            <span style="font-size:0.78rem;color:var(--muted);white-space:nowrap">Income €/mo</span>
             <input id="rw_income" type="number" value="${incomeAmt || ''}" placeholder="0"
               style="flex:1;padding:6px 8px;border:1px solid var(--border);border-radius:6px;font-size:0.85rem;font-family:var(--font);background:var(--card);color:var(--text);min-width:0">
           </div>
@@ -2074,72 +2062,41 @@ async function loadRunway() {
             style="padding:7px 14px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:0.8rem;font-weight:600;cursor:pointer;font-family:var(--font);white-space:nowrap">Apply</button>
         </div>
         ${incomeAmt > 0 && incomeMos > 0
-          ? `<div style="font-size:0.72rem;color:var(--green);margin-top:8px">→ ${incomeMos} months remaining · net burn ${fmt(effectiveBurn,0)}/mo until ${incomeUntil}</div>`
-          : incomeAmt > 0
-            ? `<div style="font-size:0.72rem;color:var(--red);margin-top:8px">⚠ Income end date is in the past — stress test only</div>`
-            : ''}
+          ? `<div style="font-size:0.72rem;color:var(--green);margin-top:8px">→ ${incomeMos} months of income · net burn ${fmt(effectiveBurn,0)}/mo during income period</div>`
+          : incomeAmt > 0 ? `<div style="font-size:0.72rem;color:var(--red);margin-top:8px">⚠ Income end date is in the past</div>` : ''}
+        ${recentNetBurn !== null ? `<div style="font-size:0.72rem;color:var(--muted);margin-top:4px">Recent pace: avg ${fmt(recentNetBurn,0)}/mo net (${completeMks.join(', ')})</div>` : ''}
       </div>
 
       <div class="section-label">Balance Projection · from today</div>
-      <div class="card" style="padding:12px 16px">
+      <div class="card" style="padding:12px 16px;margin-bottom:14px">
         <div style="position:relative;height:200px"><canvas id="runwayCanvas"></canvas></div>
       </div>
 
-      <div class="section-label">Burn Breakdown</div>
-      <div class="card" style="padding:0;overflow:hidden">
-        <div style="padding:10px 16px;border-bottom:1px solid var(--border)">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
-            <div style="font-size:0.85rem;font-weight:600">Fixed costs (incl. mortgage)</div>
-            <div style="font-size:0.9rem;font-weight:700;font-variant-numeric:tabular-nums">${fmt(fixedBurn,0)}/mo</div>
-          </div>
-          ${fixedDetailHTML}
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border)">
-          <div>
-            <div style="font-size:0.85rem;font-weight:600">Variable spending</div>
-            <div style="font-size:0.68rem;color:var(--muted)">outlier-clamped · ${completeMks.join(', ')}</div>
-          </div>
-          <div style="font-size:0.9rem;font-weight:700;font-variant-numeric:tabular-nums">${fmt(varBurn,0)}/mo</div>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border)">
-          <div>
-            <div style="font-size:0.85rem;font-weight:600">Safety buffer</div>
-            <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
-              <input id="rw_buffer" type="number" value="${Math.round(bufferPct*100)}" min="0" max="50"
-                style="width:46px;padding:3px 6px;border:1px solid var(--border);border-radius:5px;font-size:0.8rem;font-family:var(--font);background:var(--card);color:var(--text)">
-              <span style="font-size:0.68rem;color:var(--muted)">% on variable only</span>
-              <button onclick="saveRunwaySettings()"
-                style="padding:3px 8px;background:none;border:1px solid var(--border);border-radius:5px;font-size:0.72rem;cursor:pointer;font-family:var(--font)">Apply</button>
-            </div>
-          </div>
-          <div style="font-size:0.9rem;font-weight:700;font-variant-numeric:tabular-nums">+${fmt(varBurnBuffered - varBurn,0)}</div>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:var(--bg)">
-          <div style="font-size:0.9rem;font-weight:700">Total estimated burn</div>
-          <div style="font-size:1rem;font-weight:700;font-variant-numeric:tabular-nums">${fmt(structuredBurn,0)}/mo</div>
-        </div>
+      <div class="section-label">Expected vs Actual</div>
+      <div class="card" style="padding:12px 16px;margin-bottom:14px">
+        <div style="position:relative;height:200px"><canvas id="rwActualCanvas"></canvas></div>
       </div>
-
-      <div class="section-label">Liquid Pool</div>
-      <div class="card" style="padding:0;overflow:hidden">
-        ${POOL_ACCTS.filter(n => n in acctMapR).map(n => {
-          const b    = acctMapR[n];
-          const isCC = ['TDC - ING','AMEX-TDC'].includes(n);
-          return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border)">
-            <div style="display:flex;align-items:center;gap:6px">
-              <span style="font-size:0.85rem;font-weight:500">${n}</span>
-              ${isCC ? `<span style="font-size:0.62rem;color:var(--muted);background:var(--border);padding:1px 5px;border-radius:4px">CC float</span>` : ''}
-            </div>
-            <div style="font-size:0.88rem;font-weight:700;font-variant-numeric:tabular-nums;color:${b<0?'var(--red)':'var(--text)'}">${fmt(b,2)}</div>
-          </div>`;
-        }).join('')}
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:11px 16px;background:var(--bg)">
-          <div style="font-size:0.88rem;font-weight:700">Net liquid</div>
-          <div style="font-size:0.95rem;font-weight:700;font-variant-numeric:tabular-nums;color:${netLiquid<0?'var(--red)':'var(--text)'}">${fmt(netLiquid,2)}</div>
-        </div>
+      <div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">
+        <table style="width:100%;border-collapse:collapse">
+          <thead><tr style="background:var(--bg)">
+            <th style="padding:7px 10px;font-size:0.68rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:left;border-bottom:2px solid var(--border)">Month</th>
+            <th style="padding:7px 10px;font-size:0.68rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:right;border-bottom:2px solid var(--border)">Target</th>
+            <th style="padding:7px 10px;font-size:0.68rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:right;border-bottom:2px solid var(--border)">Actual</th>
+            <th style="padding:7px 10px;font-size:0.68rem;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:right;border-bottom:2px solid var(--border)">Variance</th>
+          </tr></thead>
+          <tbody>${tableRows || '<tr><td colspan="4" style="padding:20px;text-align:center;color:var(--muted);font-size:0.82rem">No historical data yet</td></tr>'}</tbody>
+        </table>
       </div>`;
 
-    if (structuredBurn > 0 && netLiquid > 0) renderRunwayChart(netLiquid, structuredBurn, incomeAmt, incomeMos, now);
+    // Balance projection chart
+    const burn = target > 0 ? target : recentNetBurn;
+    if (burn > 0 && netLiquid > 0) renderRunwayChart(netLiquid, burn, incomeAmt, incomeMos, now);
+
+    // Actual vs target chart
+    if (allCompleteMks.length > 0) {
+      renderActualVsTargetChart(allCompleteMks, expByMonth, target);
+    }
+
   } catch(e) {
     el.innerHTML = `<div class="placeholder"><div class="icon">⚠️</div><h2>Error</h2><p>${e.message}</p></div>`;
   }
@@ -2220,6 +2177,70 @@ function renderRunwayChart(startBalance, monthlyBurn, incomeAmt, incomeMos, now)
       },
       scales: {
         x: { grid: { display: false }, ticks: { font: { size: 9 }, maxTicksLimit: 12 } },
+        y: {
+          grid: { color: 'rgba(0,0,0,0.04)' },
+          ticks: { font: { size: 9 }, callback: v => v >= 1000 ? `€${(v/1000).toFixed(0)}k` : `€${v}` }
+        }
+      }
+    }
+  });
+}
+
+function renderActualVsTargetChart(mks, expByMonth, target) {
+  const canvas = document.getElementById('rwActualCanvas');
+  if (!canvas) return;
+  if (rwActualChart) { rwActualChart.destroy(); rwActualChart = null; }
+
+  const labels  = mks.slice(-12); // last 12 months max
+  const actuals = labels.map(mk => expByMonth[mk] || 0);
+  const overTarget = actuals.map(v => target > 0 && v > target);
+
+  const barColors   = overTarget.map(over => over ? 'rgba(220,38,38,0.72)' : 'rgba(5,150,105,0.72)');
+  const borderColors= overTarget.map(over => over ? '#dc2626' : '#059669');
+
+  const datasets = [{
+    label: 'Actual Spend',
+    data: actuals,
+    backgroundColor: barColors,
+    borderColor: borderColors,
+    borderWidth: 1,
+    borderRadius: 3
+  }];
+
+  if (target > 0) {
+    datasets.push({
+      label: `Target (${fmt(target, 0)})`,
+      data: labels.map(() => target),
+      type: 'line',
+      borderColor: '#d97706',
+      borderDash: [5, 3],
+      borderWidth: 2,
+      pointRadius: 0,
+      fill: false,
+      tension: 0,
+      order: 0
+    });
+  }
+
+  rwActualChart = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: target > 0,
+          position: 'bottom',
+          labels: { boxWidth: 10, font: { size: 10 }, padding: 10 }
+        },
+        tooltip: {
+          mode: 'index', intersect: false,
+          callbacks: { label: c => ` ${c.dataset.label}: ${fmt(c.raw, 0)}` }
+        }
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 9 } } },
         y: {
           grid: { color: 'rgba(0,0,0,0.04)' },
           ticks: { font: { size: 9 }, callback: v => v >= 1000 ? `€${(v/1000).toFixed(0)}k` : `€${v}` }
