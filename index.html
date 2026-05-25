@@ -557,7 +557,7 @@ async function dbGet(table, qs = '') {
 async function dbPost(table, data, upsert = false) {
   const r = await fetch(`${SB_URL}/rest/v1/${table}`, {
     method: 'POST',
-    headers: { ...HEADERS, Prefer: upsert ? 'return=representation,resolution=merge-duplicates' : 'return=representation' },
+    headers: { ...HEADERS, Prefer: upsert ? 'resolution=merge-duplicates,return=representation' : 'return=representation' },
     body: JSON.stringify(data)
   });
   if (!r.ok) throw new Error(await r.text());
