@@ -2340,10 +2340,23 @@ const OD_FOLDER   = 'Finanzas/OneMoneyApp';
 let msalInstance  = null;
 let msalReady     = false;
 
+function isMobileOrPWA() {
+  return window.matchMedia('(display-mode: standalone)').matches ||
+         window.navigator.standalone === true ||
+         /Mobi|Android/i.test(navigator.userAgent);
+}
+
 async function getMSAL() {
   if (!msalInstance) {
     msalInstance = new msal.PublicClientApplication(MSAL_CONFIG);
     await msalInstance.initialize();
+    // Must be called on every page load to complete redirect login flow
+    try {
+      const redirectResult = await msalInstance.handleRedirectPromise();
+      if (redirectResult) {
+        msalInstance.setActiveAccount(redirectResult.account);
+      }
+    } catch(e) { console.warn('MSAL redirect handling:', e); }
     msalReady = true;
   }
   return msalInstance;
@@ -2388,9 +2401,15 @@ async function initOneDrive() {
 async function connectOneDrive() {
   try {
     const app = await getMSAL();
-    const res = await app.loginPopup({ scopes: OD_SCOPES });
-    app.setActiveAccount(res.account);
-    await initOneDrive();
+    if (isMobileOrPWA()) {
+      // Mobile/PWA: popup is blocked — use redirect flow instead.
+      // Page will navigate away; login completes on return via handleRedirectPromise().
+      await app.loginRedirect({ scopes: OD_SCOPES });
+    } else {
+      const res = await app.loginPopup({ scopes: OD_SCOPES });
+      app.setActiveAccount(res.account);
+      await initOneDrive();
+    }
   } catch(e) {
     const msg = e.errorCode || e.message || String(e);
     toast('Login error: ' + msg);
