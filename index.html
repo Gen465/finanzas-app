@@ -1650,13 +1650,22 @@ async function editGroupBudget(groupLabel) {
 }
 
 // ── Runway ────────────────────────────────────────────────────────────────────
-function saveRunwaySettings() {
+async function saveRunwaySettings() {
   const income      = parseFloat(document.getElementById('rw_income')?.value      || '0') || 0;
   const incomeUntil = document.getElementById('rw_incomeUntil')?.value             || '';
   const buffer      = parseFloat(document.getElementById('rw_buffer')?.value      || '15') || 15;
+  // Cache locally for speed
   localStorage.setItem('rw_income',      income);
   localStorage.setItem('rw_incomeUntil', incomeUntil);
   localStorage.setItem('rw_buffer',      buffer);
+  // Persist to Supabase so any device picks it up
+  try {
+    await dbPost('app_settings', [
+      { key: 'rw_income',      value: String(income) },
+      { key: 'rw_incomeUntil', value: incomeUntil },
+      { key: 'rw_buffer',      value: String(buffer) }
+    ], true);
+  } catch(e) { console.warn('Settings sync failed:', e); }
   loadRunway();
 }
 
@@ -1681,11 +1690,19 @@ async function loadRunway() {
     const todayMk = monthKey(now.getMonth(), now.getFullYear());
     const minMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
 
-    const [accounts, txExp, budgets] = await Promise.all([
+    const [accounts, txExp, budgets, sbSettings] = await Promise.all([
       dbGet('accounts', '?select=name,balance'),
       dbGet('transactions', '?type=eq.Expense&select=amount,month_year,category'),
-      dbGet('budget_targets', `?year=eq.${activeYear}&select=category,monthly_budget`)
+      dbGet('budget_targets', `?year=eq.${activeYear}&select=category,monthly_budget`),
+      dbGet('app_settings', '?key=in.(rw_income,rw_incomeUntil,rw_buffer)').catch(() => [])
     ]);
+
+    // Merge Supabase settings over localStorage (Supabase wins — cross-device source of truth)
+    const sMap = {};
+    sbSettings.forEach(s => { sMap[s.key] = s.value; });
+    if (sMap['rw_income'])      localStorage.setItem('rw_income',      sMap['rw_income']);
+    if (sMap['rw_incomeUntil']) localStorage.setItem('rw_incomeUntil', sMap['rw_incomeUntil']);
+    if (sMap['rw_buffer'])      localStorage.setItem('rw_buffer',      sMap['rw_buffer']);
 
     const acctMapR = {};
     accounts.forEach(a => { acctMapR[a.name] = +a.balance; });
