@@ -557,10 +557,11 @@ async function dbGet(table, qs = '') {
 async function dbPost(table, data, upsert = false) {
   const r = await fetch(`${SB_URL}/rest/v1/${table}`, {
     method: 'POST',
-    headers: { ...HEADERS, Prefer: upsert ? 'resolution=merge-duplicates' : 'return=representation' },
+    headers: { ...HEADERS, Prefer: upsert ? 'return=representation,resolution=merge-duplicates' : 'return=representation' },
     body: JSON.stringify(data)
   });
   if (!r.ok) throw new Error(await r.text());
+  if (r.status === 204) return [];
   return r.json();
 }
 async function dbPatch(table, qs, data) {
@@ -1915,7 +1916,11 @@ async function saveRunwaySettings() {
       { key: 'rw_incomeUntil', value: incomeUntil },
       { key: 'rw_target',      value: String(target) }
     ], true);
-  } catch(e) { console.warn('Settings sync failed:', e); }
+    toast('Settings saved ✓');
+  } catch(e) {
+    toast('Sync error: ' + e.message);
+    console.error('Settings sync failed:', e);
+  }
   loadRunway();
 }
 
@@ -2535,9 +2540,14 @@ async function loadMortgage() {
       runBal += mBreak[mk].p; // add back principal to get balance before this payment
     });
 
-    // Derive amortisation rate & payment from last known payment
+    // Derive amortisation rate & payment from last known payment (fallback for pre-June-2026)
     const amortR   = (lastPay && mtgBal > 0) ? lastPay.i / (mtgBal + lastPay.p) : 0;
     const amortPmt = lastPay ? (lastPay.i + lastPay.p) : 0;
+
+    // New rate/payment from June 2026 onwards (rate renegotiated to 3.77%, payment €3,003)
+    const NEW_RATE_PMT_START = new Date(2026, 5, 1); // June 2026
+    const NEW_MONTHLY_RATE   = 0.0377 / 12;          // 0.003142
+    const NEW_PMT            = 3003;
 
     // Project next 6 months via amortisation formula
     const futureRows = [];
@@ -2547,8 +2557,11 @@ async function loadMortgage() {
         const fd  = new Date(now.getFullYear(), now.getMonth() + i, 1);
         const fmk = monthKey(fd.getMonth(), fd.getFullYear());
         if (mBreak[fmk]) continue; // already have real data for this month
-        const fi = projBal * amortR;
-        const fp = amortPmt - fi;
+        const useNew  = fd >= NEW_RATE_PMT_START;
+        const projR   = useNew ? NEW_MONTHLY_RATE : amortR;
+        const projPmt = useNew ? NEW_PMT          : amortPmt;
+        const fi = projBal * projR;
+        const fp = projPmt - fi;
         projBal  = Math.max(0, projBal - fp);
         futureRows.push({ mk: fmk, i: fi, p: fp, bal: projBal, projected: true });
       }
@@ -2563,10 +2576,12 @@ async function loadMortgage() {
       } else {
         let pb = mtgBal;
         for (let i = 1; i <= 360; i++) { // cap at 30 years
-          pb = Math.max(0, pb - (amortPmt - pb * amortR));
+          const fd2 = new Date(now.getFullYear(), now.getMonth() + i, 1);
+          const r2  = fd2 >= NEW_RATE_PMT_START ? NEW_MONTHLY_RATE : amortR;
+          const p2  = fd2 >= NEW_RATE_PMT_START ? NEW_PMT          : amortPmt;
+          pb = Math.max(0, pb - (p2 - pb * r2));
           if (pb <= ltv65Target) {
-            const fd = new Date(now.getFullYear(), now.getMonth() + i, 1);
-            ltv65Date = MONTHS_ES[fd.getMonth()] + '-' + String(fd.getFullYear()).slice(2);
+            ltv65Date = MONTHS_ES[fd2.getMonth()] + '-' + String(fd2.getFullYear()).slice(2);
             break;
           }
         }
