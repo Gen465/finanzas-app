@@ -2027,17 +2027,26 @@ async function loadRunway() {
       txExp.filter(r => r.month_year !== todayMk).map(r => r.month_year)
     )].sort(mkSort).filter(mk => mkSort(mk, 'Abr-26') >= 0);
 
+    // Include current partial month if it has data (for chart + table)
+    const displayPastMks = expByMonth[todayMk]
+      ? [...allCompleteMks, todayMk].sort(mkSort)
+      : allCompleteMks;
+
     const RTHTD = 'padding:7px 8px;font-size:0.78rem;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums';
 
     // Past rows: Month | Actual Spend | vs Target | Actual Liquid (reconstructed)
-    const pastTableRows = allCompleteMks.map(mk => {
+    const pastTableRows = displayPastMks.map(mk => {
+      const isPartial = mk === todayMk;
       const actual = expByMonth[mk] || 0;
-      const liq    = liquidByMonth[mk];
+      const liq    = isPartial ? netLiquid : liquidByMonth[mk];
       const vTgt   = target > 0 ? actual - target : null;
       const tgtC   = vTgt === null ? '' : vTgt > 0 ? 'var(--red)' : 'var(--green)';
       const liqC   = liq !== undefined && liq < netLiquid * 0.3 ? 'var(--red)' : 'var(--muted)';
-      return `<tr>
-        <td style="${RTHTD};font-weight:500">${mk}</td>
+      const mkLabel = isPartial
+        ? `${mk} <span style="font-size:0.62rem;color:var(--muted);font-weight:400">(partial)</span>`
+        : mk;
+      return `<tr${isPartial ? ' style="background:rgba(30,64,175,0.04)"' : ''}>
+        <td style="${RTHTD};font-weight:500">${mkLabel}</td>
         <td style="${RTHTD};text-align:right;font-weight:600">${fmt(actual,0)}</td>
         <td style="${RTHTD};text-align:right;font-weight:700;color:${tgtC}">${vTgt !== null ? (vTgt > 0 ? '+' : '') + fmt(vTgt,0) : '—'}</td>
         <td style="${RTHTD};text-align:right;color:${liqC};font-style:italic">${liq !== undefined ? fmt(liq,0) : '—'}</td>
@@ -2166,10 +2175,10 @@ async function loadRunway() {
       ${unifiedTable}`;
 
     // Graph 1: Liquid Balance Journey — past actual + target-path lines, future @target + @pace projections
-    renderRunwayChart(netLiquid, target, recentNetBurn, incomeAmt, incomeMos, runwayTarget, runwayRecent, now, allCompleteMks, liquidByMonth);
+    renderRunwayChart(netLiquid, target, recentNetBurn, incomeAmt, incomeMos, runwayTarget, runwayRecent, now, displayPastMks, liquidByMonth);
 
     // Graph 2: Monthly Spend vs Target — actual bars (past) + ghost bars (future) + orange target line
-    renderActualVsTargetChart(allCompleteMks, expByMonth, target, recentNetBurn, now, runwayTarget, runwayRecent, incomeAmt, incomeMos);
+    renderActualVsTargetChart(displayPastMks, expByMonth, target, recentNetBurn, now, runwayTarget, runwayRecent, incomeAmt, incomeMos);
 
   } catch(e) {
     el.innerHTML = `<div class="placeholder"><div class="icon">⚠️</div><h2>Error</h2><p>${e.message}</p></div>`;
@@ -2189,10 +2198,13 @@ function renderRunwayChart(netLiquid, target, recentBurn, incomeAmt, incomeMos, 
   const ANCHOR_DATE = new Date(2026, 3, 1);
   const todayMk = monthKey(now.getMonth(), now.getFullYear());
 
-  // Past: complete months from April-26 onwards, sorted
+  // Past: all display months from April-26 onwards (includes today's partial month)
   const validPast = (pastMks || [])
-    .filter(mk => { const d = mkToDate(mk); return d >= ANCHOR_DATE && mk !== todayMk; })
+    .filter(mk => { const d = mkToDate(mk); return d >= ANCHOR_DATE; })
     .sort(mkSort);
+
+  // nowIdx = last past month (today's month is the last entry in validPast)
+  const nowIdx = Math.max(0, validPast.length - 1);
 
   // Future window: until both projections hit zero
   const rwT = runwayTarget ?? 0;
@@ -2205,17 +2217,15 @@ function renderRunwayChart(netLiquid, target, recentBurn, incomeAmt, incomeMos, 
     return monthKey(d.getMonth(), d.getFullYear());
   });
 
-  // Full X-axis: past months + 'NOW' divider + future months
-  const allLabels = [...validPast, 'NOW', ...futureMks];
-  const nowIdx = validPast.length; // index of 'NOW'
+  // Full X-axis: past months (incl. today) + future months — no separate 'NOW' label
+  const allLabels = [...validPast, ...futureMks];
 
   const datasets = [];
 
-  // ── Dataset 1: Actual past liquid (solid dark, past section + NOW point) ──
+  // ── Dataset 1: Actual past liquid (solid dark — left of NOW line inclusive) ──
   {
     const data = allLabels.map((lbl, i) => {
-      if (i < nowIdx) return (liquidByMonth && liquidByMonth[lbl] !== undefined) ? liquidByMonth[lbl] : null;
-      if (i === nowIdx) return netLiquid;
+      if (i <= nowIdx) return (liquidByMonth && liquidByMonth[lbl] !== undefined) ? liquidByMonth[lbl] : null;
       return null;
     });
     if (data.some(v => v !== null)) {
@@ -2230,29 +2240,32 @@ function renderRunwayChart(netLiquid, target, recentBurn, incomeAmt, incomeMos, 
     }
   }
 
-  // ── Dataset 2: Target should-have-been (dashed green, past section + NOW) ──
-  // Starts at April's liquid; each subsequent month subtracts the target net burn.
-  // April = no income; May onwards = max(0, target - incomeAmt) if in income window.
+  // ── Dataset 2: Target should-have-been (dashed green, past section) ──
+  // Starts at April's liquid; subtracts target net burn each month.
+  // April = no income (m=0); May onwards (m≥1) = max(0, target - incomeAmt).
+  // Today's partial month gets a day-fraction burn.
   if (target > 0) {
+    const todayMkLocal = monthKey(now.getMonth(), now.getFullYear());
     const aprLiq = (liquidByMonth && liquidByMonth[ANCHOR] !== undefined) ? liquidByMonth[ANCHOR] : netLiquid;
     const data = allLabels.map((lbl, i) => {
       if (i > nowIdx) return null;
       if (lbl === ANCHOR) return aprLiq;
-      // Months elapsed from April (month 3, 2026) to this label
-      const labelDate = lbl === 'NOW' ? now : mkToDate(lbl);
+      const labelDate = mkToDate(lbl);
       const monthsFromApr = (labelDate.getFullYear() - 2026) * 12 + (labelDate.getMonth() - 3);
       let bal = aprLiq;
-      for (let m = 1; m <= monthsFromApr; m++) {
-        // m=1 = May (first income month); income applies if incomeAmt > 0
-        const hasIncome = incomeAmt > 0 && m >= 1; // May onwards
+      // Apply full burn for each complete month between April and this label's month
+      for (let m = 1; m < monthsFromApr; m++) {
+        const hasIncome = incomeAmt > 0; // m≥1 means May or later
         bal -= hasIncome ? Math.max(0, target - incomeAmt) : target;
         if (bal <= 0) return 0;
       }
-      // For the 'NOW' label: add fractional burn of the current partial month
-      if (lbl === 'NOW') {
-        const hasIncome = incomeAmt > 0 && monthsFromApr >= 1;
+      // Apply burn for this label's own month
+      if (monthsFromApr > 0) {
+        const hasIncome = incomeAmt > 0;
         const monthBurn = hasIncome ? Math.max(0, target - incomeAmt) : target;
-        bal -= monthBurn * (now.getDate() / 30);
+        // Partial if this is today's month, full otherwise
+        const fraction = (lbl === todayMkLocal) ? (now.getDate() / 30) : 1;
+        bal -= monthBurn * fraction;
       }
       return Math.max(0, bal);
     });
@@ -2266,11 +2279,11 @@ function renderRunwayChart(netLiquid, target, recentBurn, incomeAmt, incomeMos, 
     });
   }
 
-  // ── Dataset 3: @Target projection (solid green, NOW + future) ──
+  // ── Dataset 3: @Target projection (solid green, from NOW month forward) ──
   if (target > 0) {
     const data = allLabels.map((lbl, i) => {
       if (i < nowIdx) return null;
-      const fi = i - nowIdx; // 0 = NOW, 1 = 1st future month, …
+      const fi = i - nowIdx; // 0 = today's month, 1 = next month, …
       let bal = netLiquid;
       for (let m = 0; m < fi; m++) {
         const hasIncome = incomeAmt > 0 && m < incomeMos;
@@ -2289,7 +2302,7 @@ function renderRunwayChart(netLiquid, target, recentBurn, incomeAmt, incomeMos, 
     });
   }
 
-  // ── Dataset 4: @Pace projection (blue dashed, NOW + future) ──
+  // ── Dataset 4: @Pace projection (blue dashed, from NOW month forward) ──
   if (recentBurn && recentBurn > 0) {
     const data = allLabels.map((lbl, i) => {
       if (i < nowIdx) return null;
