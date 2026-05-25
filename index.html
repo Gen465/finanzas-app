@@ -2034,53 +2034,57 @@ async function loadRunway() {
 
     const RTHTD = 'padding:7px 8px;font-size:0.78rem;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums';
 
-    // Past rows: Month | Actual Spend | vs Target | Actual Liquid (reconstructed)
+    // Table: Month | Liquid | Income | Expense | vs Target
+    const TH = 'padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border)';
     const pastTableRows = displayPastMks.map(mk => {
       const isPartial = mk === todayMk;
-      const actual = expByMonth[mk] || 0;
-      const liq    = isPartial ? netLiquid : liquidByMonth[mk];
-      const vTgt   = target > 0 ? actual - target : null;
-      const tgtC   = vTgt === null ? '' : vTgt > 0 ? 'var(--red)' : 'var(--green)';
-      const liqC   = liq !== undefined && liq < netLiquid * 0.3 ? 'var(--red)' : 'var(--muted)';
+      const exp = expByMonth[mk] || 0;
+      const inc = cashIncByMonth[mk] || 0;
+      const liq = isPartial ? netLiquid : liquidByMonth[mk];
+      const vTgt  = target > 0 ? exp - target : null;
+      const tgtC  = vTgt === null ? '' : vTgt > 0 ? 'var(--red)' : 'var(--green)';
+      const liqC  = liq !== undefined && liq < netLiquid * 0.3 ? 'var(--red)' : 'var(--muted)';
       const mkLabel = isPartial
         ? `${mk} <span style="font-size:0.62rem;color:var(--muted);font-weight:400">(partial)</span>`
         : mk;
       return `<tr${isPartial ? ' style="background:rgba(30,64,175,0.04)"' : ''}>
         <td style="${RTHTD};font-weight:500">${mkLabel}</td>
-        <td style="${RTHTD};text-align:right;font-weight:600">${fmt(actual,0)}</td>
-        <td style="${RTHTD};text-align:right;font-weight:700;color:${tgtC}">${vTgt !== null ? (vTgt > 0 ? '+' : '') + fmt(vTgt,0) : '—'}</td>
         <td style="${RTHTD};text-align:right;color:${liqC};font-style:italic">${liq !== undefined ? fmt(liq,0) : '—'}</td>
+        <td style="${RTHTD};text-align:right;color:var(--green)">${inc > 0 ? fmt(inc,0) : '—'}</td>
+        <td style="${RTHTD};text-align:right;font-weight:600">${fmt(exp,0)}</td>
+        <td style="${RTHTD};text-align:right;font-weight:700;color:${tgtC}">${vTgt !== null ? (vTgt > 0 ? '+' : '') + fmt(vTgt,0) : '—'}</td>
       </tr>`;
     }).join('');
 
-    // NOW separator row (blue banner)
+    // NOW separator
     const todaySepRow = `
       <tr style="background:var(--accent)">
-        <td colspan="4" style="padding:7px 8px;font-size:0.72rem;font-weight:700;color:white;text-align:center;letter-spacing:0.03em">
+        <td colspan="5" style="padding:7px 8px;font-size:0.72rem;font-weight:700;color:white;text-align:center;letter-spacing:0.03em">
           NOW · Liquid: ${fmt(netLiquid,0)}
         </td>
       </tr>`;
 
-    // Future projection rows: Month | Projected Spend | — | Projected Liquid
+    // Future rows: Month | Projected Liquid | Expected Income | Target Expense | —
     const futProjRows = [];
     let liqTgt = netLiquid, liqPace = netLiquid;
     const futLimit = Math.min(36, Math.ceil(Math.max(runwayTarget ?? 0, runwayRecent ?? 0, 6)) + 2);
     for (let i = 1; i <= futLimit; i++) {
-      const fd      = new Date(now.getFullYear(), now.getMonth() + i, 1);
-      const fmk     = monthKey(fd.getMonth(), fd.getFullYear());
-      const inIncP  = incomeAmt > 0 && incomeMos > 0 && i <= incomeMos;
-      const tgtBurn = target > 0 ? (inIncP ? Math.max(0, target - incomeAmt) : target) : 0;
+      const fd       = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      const fmk      = monthKey(fd.getMonth(), fd.getFullYear());
+      const inIncP   = incomeAmt > 0 && incomeMos > 0 && i <= incomeMos;
+      const projInc  = inIncP ? incomeAmt : 0;
+      const tgtBurn  = target > 0 ? (inIncP ? Math.max(0, target - incomeAmt) : target) : 0;
       const paceBurn = recentNetBurn ?? 0;
       liqTgt  = Math.max(0, liqTgt  - tgtBurn);
       liqPace = Math.max(0, liqPace - paceBurn);
-      const showLiq  = target > 0 ? liqTgt : liqPace;
-      const showBurn = target > 0 ? tgtBurn : (paceBurn > 0 ? paceBurn : 0);
+      const showLiq = target > 0 ? liqTgt : liqPace;
       const liqC    = showLiq < 5000 ? 'var(--red)' : showLiq < netLiquid * 0.4 ? 'var(--yellow)' : 'var(--muted)';
       futProjRows.push(`<tr style="opacity:0.72">
         <td style="${RTHTD};font-style:italic">${fmk}</td>
-        <td style="${RTHTD};text-align:right;font-style:italic;color:var(--muted)">${showBurn > 0 ? fmt(showBurn,0) : '—'}</td>
-        <td style="${RTHTD};text-align:right;font-style:italic;color:var(--muted)">—</td>
         <td style="${RTHTD};text-align:right;font-weight:700;color:${liqC}">${fmt(showLiq,0)}</td>
+        <td style="${RTHTD};text-align:right;font-style:italic;color:var(--green)">${projInc > 0 ? fmt(projInc,0) : '—'}</td>
+        <td style="${RTHTD};text-align:right;font-style:italic;color:var(--muted)">${target > 0 ? fmt(target,0) : '—'}</td>
+        <td style="${RTHTD};text-align:right;font-style:italic;color:var(--muted)">—</td>
       </tr>`);
       if (liqTgt <= 0 && liqPace <= 0) break;
     }
@@ -2089,19 +2093,20 @@ async function loadRunway() {
       <div class="card" style="padding:0;overflow:hidden;margin-bottom:14px">
         <table style="width:100%;border-collapse:collapse">
           <thead><tr style="background:var(--bg)">
-            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:left">Month</th>
-            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:right">Spend</th>
-            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:right">vs Target${target > 0 ? ` (${fmt(target,0)})` : ''}</th>
-            <th style="padding:6px 8px;font-size:0.61rem;font-weight:700;text-transform:uppercase;color:var(--muted);border-bottom:2px solid var(--border);text-align:right">Liquid</th>
+            <th style="${TH};text-align:left">Month</th>
+            <th style="${TH};text-align:right">Liquid</th>
+            <th style="${TH};text-align:right">Income</th>
+            <th style="${TH};text-align:right">Expense</th>
+            <th style="${TH};text-align:right">vs Target${target > 0 ? ` (${fmt(target,0)})` : ''}</th>
           </tr></thead>
           <tbody>
-            ${pastTableRows || '<tr><td colspan="4" style="padding:20px;text-align:center;color:var(--muted);font-size:0.82rem">No historical data yet</td></tr>'}
+            ${pastTableRows || '<tr><td colspan="5" style="padding:20px;text-align:center;color:var(--muted);font-size:0.82rem">No historical data yet</td></tr>'}
             ${todaySepRow}
             ${futProjRows.join('')}
           </tbody>
         </table>
         <div style="padding:6px 10px;font-size:0.64rem;color:var(--muted);border-top:1px solid var(--border);background:var(--bg)">
-          Past liquid estimated by walking backwards from today's known balance · Future projected at @target${recentNetBurn ? ' / @pace' : ''}
+          Liquid: reconstructed from today's balance · Income: actual received (excl. valuation) · Expense: all cash outflows · Future: projected at @target
         </div>
       </div>`;
 
