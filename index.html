@@ -688,7 +688,7 @@ async function loadDashboard() {
       const total = g.accounts.reduce((s, n) => s + (acctMap[n] || 0), 0);
       return `<div class="nw-row">
         <div class="nw-label"><div class="nw-dot" style="background:${g.color}"></div>${g.label}</div>
-        <div class="nw-value" style="${total < 0 ? 'color:var(--red)' : ''}">${fmt(total, 0)}</div>
+        <div class="nw-value nw-blur-val" style="${total < 0 ? 'color:var(--red)' : ''}">${fmt(total, 0)}</div>
       </div>`;
     }).join('');
 
@@ -1188,11 +1188,12 @@ function toggleNWBlur() {
   applyNWBlur();
 }
 function applyNWBlur() {
-  const el = document.getElementById('nwHeroVal');
-  const btn = document.getElementById('nwBlurBtn');
-  if (!el) return;
-  el.style.filter  = nwBlurred ? 'blur(8px)' : '';
-  el.style.userSelect = nwBlurred ? 'none' : '';
+  const heroEl = document.getElementById('nwHeroVal');
+  const btn    = document.getElementById('nwBlurBtn');
+  const f      = nwBlurred ? 'blur(8px)' : '';
+  const sel    = nwBlurred ? 'none' : '';
+  if (heroEl) { heroEl.style.filter = f; heroEl.style.userSelect = sel; }
+  document.querySelectorAll('.nw-blur-val').forEach(el => { el.style.filter = f; el.style.userSelect = sel; });
   if (btn) btn.style.opacity = nwBlurred ? '1' : '0.6';
 }
 
@@ -1200,18 +1201,17 @@ function applyNWBlur() {
 let wealthChart1 = null, wealthChart2 = null;
 
 async function loadWealthView(el, heroCard, viewToggle, acctMap) {
-  // Investment settings from app_settings
-  const settings = await dbGet('app_settings', '?key=in.(finax_cost_basis,finax_return_pct,investment_snapshots)').catch(() => []);
+  // Investment settings
+  const settings = await dbGet('app_settings', '?key=in.(finax_cost_basis,finax_return_pct)').catch(() => []);
   const sMap = {};
   settings.forEach(s => { sMap[s.key] = s.value; });
 
-  const finaxVal      = acctMap['ETFMatic'] || 0;
-  const t212Val       = acctMap['Trade212']  || 0;
-  const finaxCost     = parseFloat(sMap['finax_cost_basis'] || '57300');
-  const finaxRetPct   = parseFloat(sMap['finax_return_pct'] || '60.51');
-  const finaxGain     = finaxVal - finaxCost;
-  const t212Daily     = t212Val > 0 ? (t212Val * 0.03 / 365) : 0;
-  const snapshots     = JSON.parse(sMap['investment_snapshots'] || '[]');
+  const finaxVal    = acctMap['ETFMatic'] || 0;
+  const t212Val     = acctMap['Trade212']  || 0;
+  const finaxCost   = parseFloat(sMap['finax_cost_basis'] || '57300');
+  const finaxRetPct = parseFloat(sMap['finax_return_pct'] || '60.51');
+  const finaxGain   = finaxVal - finaxCost;
+  const t212Daily   = t212Val > 0 ? (t212Val * 0.03 / 365) : 0;
 
   // Section 1 — cards
   const cardsHTML = `
@@ -1229,75 +1229,102 @@ async function loadWealthView(el, heroCard, viewToggle, acctMap) {
       </div>
     </div>`;
 
-  // Section 2 — Finax value chart (from snapshots)
-  const snap = snapshots.filter(s => s.finax);
-  const snapDates  = snap.map(s => s.date);
-  const snapValues = snap.map(s => s.finax);
-  const snapCosts  = snap.map(s => s.cost || finaxCost);
-  // Always include today
-  const today = new Date().toISOString().slice(0,10);
-  if (!snapDates.includes(today)) { snapDates.push(today); snapValues.push(finaxVal); snapCosts.push(finaxCost); }
+  // Section 2 — Reconstruct Finax history from transaction data
+  // Valuacion income = ETF gains; transfers to/from ETFMatic = deposits/withdrawals
+  const [etfIncome, etfDepositsIn, etfWithdrawalsOut] = await Promise.all([
+    dbGet('transactions', '?type=eq.Income&category=eq.Valuacion&select=amount,month_year'),
+    dbGet('transactions', '?type=eq.Transfer&category=eq.ETFMatic&select=amount,month_year'),
+    dbGet('transactions', '?type=eq.Transfer&from_account=eq.ETFMatic&select=amount,month_year')
+  ]);
+
+  const valByMonth = {}, netDepByMonth = {};
+  etfIncome.forEach(r => { valByMonth[r.month_year] = (valByMonth[r.month_year] || 0) + +r.amount; });
+  etfDepositsIn.forEach(r => { netDepByMonth[r.month_year] = (netDepByMonth[r.month_year] || 0) + +r.amount; });
+  etfWithdrawalsOut.forEach(r => { netDepByMonth[r.month_year] = (netDepByMonth[r.month_year] || 0) - +r.amount; });
+
+  // Build sorted list of all months with any ETF activity
+  const now2 = new Date();
+  const currentMk = `${MONTHS_ES[now2.getMonth()]}-${String(now2.getFullYear()).slice(2)}`;
+  const histMonths = [...new Set([...Object.keys(valByMonth), ...Object.keys(netDepByMonth)])]
+    .filter(mk => mk !== currentMk).sort(mkSort);
+
+  // Walk backwards from current known balance to reconstruct each month-end balance
+  const balByMonth = { [currentMk]: finaxVal };
+  let cumVal = valByMonth[currentMk] || 0;
+  let cumDep = netDepByMonth[currentMk] || 0;
+  for (let i = histMonths.length - 1; i >= 0; i--) {
+    const mk = histMonths[i];
+    balByMonth[mk] = Math.max(0, finaxVal - cumVal - cumDep);
+    cumVal += (valByMonth[mk] || 0);
+    cumDep += (netDepByMonth[mk] || 0);
+  }
+
+  const chartMonths = [...histMonths, currentMk];
+  const chartLabels = chartMonths.map(mk => mk);
+  const chartValues = chartMonths.map(mk => balByMonth[mk] || 0);
+  const hasHistory  = histMonths.length > 0;
 
   const chartHTML = `
     <div class="card" style="margin-bottom:14px">
       <div class="card-title">Finax Portfolio Value</div>
-      <div style="font-size:0.72rem;color:var(--muted);margin-bottom:8px;padding:0 2px">${snap.length < 2 ? 'Chart builds as you import CSVs — check back next month.' : ''}</div>
-      <div style="position:relative;height:180px"><canvas id="wealthChart1"></canvas></div>
+      ${!hasHistory ? `<div style="font-size:0.72rem;color:var(--muted);padding:0 2px 8px">Book your first Valuacion income transaction in 1Money to start the chart.</div>` : ''}
+      <div style="position:relative;height:200px"><canvas id="wealthChart1"></canvas></div>
     </div>`;
 
-  // Section 3 — Monthly passive income
-  const yr = yy(activeYear);
-  const passiveTx = await dbGet('transactions',
-    `?type=eq.Income&month_year=like.*-${yr}&category=in.(Valuacion,Interest)&select=amount,month_year`).catch(() => []);
-  const passiveTx2 = await dbGet('transactions',
-    `?type=eq.Income&month_year=like.*-${yr}&sub_category=eq.Intereses&select=amount,month_year`).catch(() => []);
-  const allPassive = [...passiveTx, ...passiveTx2];
+  // Section 3 — Monthly passive income (all available history, last 24 months)
+  const [passiveVal, passiveInt] = await Promise.all([
+    dbGet('transactions', '?type=eq.Income&category=eq.Valuacion&select=amount,month_year'),
+    dbGet('transactions', '?type=eq.Income&sub_category=eq.Intereses&select=amount,month_year')
+  ]);
   const passiveByMonth = {};
-  MONTHS_ES.forEach(m => { passiveByMonth[`${m}-${yr}`] = 0; });
-  allPassive.forEach(r => { if (r.month_year in passiveByMonth) passiveByMonth[r.month_year] += +r.amount; });
-  const passiveMonths = MONTHS_ES.map(m => `${m}-${yr}`);
-  const passiveLabels = MONTHS_ES;
+  [...passiveVal, ...passiveInt].forEach(r => {
+    passiveByMonth[r.month_year] = (passiveByMonth[r.month_year] || 0) + +r.amount;
+  });
+  const passiveMonths = Object.keys(passiveByMonth).sort(mkSort).slice(-24);
   const passiveData   = passiveMonths.map(mk => passiveByMonth[mk]);
 
   const passiveHTML = `
     <div class="card" style="margin-bottom:14px">
-      <div class="card-title">Monthly Passive Income · ${activeYear}</div>
+      <div class="card-title">Monthly Passive Income</div>
       <div style="position:relative;height:180px"><canvas id="wealthChart2"></canvas></div>
     </div>`;
 
   el.innerHTML = heroCard + viewToggle + cardsHTML + chartHTML + passiveHTML;
   applyNWBlur();
 
-  // Render chart 1 — Finax value vs cost
+  // Render chart 1 — Finax reconstructed value
   if (wealthChart1) { wealthChart1.destroy(); wealthChart1 = null; }
   const c1 = document.getElementById('wealthChart1');
-  if (c1 && snapDates.length >= 1) {
+  if (c1) {
     wealthChart1 = new Chart(c1, {
       type: 'line',
       data: {
-        labels: snapDates,
+        labels: chartLabels,
         datasets: [
-          { label:'Portfolio Value', data: snapValues, borderColor:'#3b82f6', backgroundColor:'rgba(59,130,246,0.08)', fill:true, tension:0.3, pointRadius:3 },
-          { label:'Net Deposits',    data: snapCosts,  borderColor:'#f59e0b', borderDash:[5,4], backgroundColor:'transparent', fill:false, tension:0.1, pointRadius:2 }
+          { label:'Portfolio Value', data: chartValues, borderColor:'#3b82f6', backgroundColor:'rgba(59,130,246,0.1)', fill:true, tension:0.3, pointRadius: chartValues.length > 24 ? 0 : 3 },
+          { label:'Net Cost Basis',  data: chartValues.map(() => finaxCost), borderColor:'#f59e0b', borderDash:[5,4], backgroundColor:'transparent', fill:false, tension:0, pointRadius:0 }
         ]
       },
-      options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'bottom', labels:{ font:{size:11}, boxWidth:12 }}},
-        scales:{ y:{ ticks:{ callback: v => '€'+Math.round(v/1000)+'k' }, grid:{ color:'rgba(0,0,0,0.05)' }}, x:{ ticks:{ font:{size:10}, maxTicksLimit:6 }}}}
+      options: { responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{ position:'bottom', labels:{ font:{size:11}, boxWidth:12 }}},
+        scales:{ y:{ ticks:{ callback: v => '€'+Math.round(v/1000)+'k' }, grid:{ color:'rgba(0,0,0,0.05)' }},
+                 x:{ ticks:{ font:{size:10}, maxTicksLimit:8 }}}}
     });
   }
 
   // Render chart 2 — Monthly passive income
   if (wealthChart2) { wealthChart2.destroy(); wealthChart2 = null; }
   const c2 = document.getElementById('wealthChart2');
-  if (c2) {
+  if (c2 && passiveMonths.length > 0) {
     wealthChart2 = new Chart(c2, {
       type: 'bar',
       data: {
-        labels: passiveLabels,
+        labels: passiveMonths,
         datasets: [{ label:'Passive Income', data: passiveData, backgroundColor:'rgba(6,182,212,0.7)', borderColor:'#06b6d4', borderWidth:1, borderRadius:4 }]
       },
       options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false }},
-        scales:{ y:{ ticks:{ callback: v => '€'+v }, grid:{ color:'rgba(0,0,0,0.05)' }}, x:{ ticks:{ font:{size:10} }}}}
+        scales:{ y:{ ticks:{ callback: v => '€'+v }, grid:{ color:'rgba(0,0,0,0.05)' }},
+                 x:{ ticks:{ font:{size:10}, maxRotation:45 }}}}
     });
   }
 }
@@ -1316,29 +1343,6 @@ function editInvestmentSettings() {
   loadDashboard();
 }
 
-// Snapshot investment balances after each import
-async function snapshotInvestmentBalances() {
-  try {
-    const accounts = await dbGet('accounts', '?select=name,balance');
-    const aMap = {};
-    accounts.forEach(a => { aMap[a.name] = +a.balance; });
-    const finaxVal = aMap['ETFMatic'] || 0;
-    const t212Val  = aMap['Trade212']  || 0;
-    if (!finaxVal && !t212Val) return;
-
-    const settings = await dbGet('app_settings', '?key=eq.investment_snapshots').catch(() => []);
-    const existing = JSON.parse(settings[0]?.value || '[]');
-    const today    = new Date().toISOString().slice(0,10);
-    const finaxCost = parseFloat(localStorage.getItem('finax_cost_basis') || '57300');
-
-    // Only add if date changed or values changed
-    const last = existing[existing.length - 1];
-    if (last && last.date === today && last.finax === finaxVal && last.t212 === t212Val) return;
-
-    existing.push({ date: today, finax: finaxVal, t212: t212Val, cost: finaxCost });
-    await dbPost('app_settings', [{ key:'investment_snapshots', value: JSON.stringify(existing) }], true);
-  } catch(e) { console.warn('Snapshot failed:', e); }
-}
 
 function buildCatBars(topCats) {
   const max   = topCats[0][1];
@@ -2645,7 +2649,6 @@ async function importFromOneDrive() {
       await dbPost('transactions', newTx.slice(i, i+100));
     await updateAccountBalances(balances);
     await dbPost('import_log', { filename: info.name, row_count: newTx.length });
-    await snapshotInvestmentBalances();
     toast(`✅ ${newTx.length} new transactions imported`);
     latestEl.textContent = `Latest: ${info.name}`;
     loadImportLog();
@@ -2818,7 +2821,6 @@ async function confirmImport() {
       await dbPost('transactions', newTx.slice(i, i+100));
     await updateAccountBalances(balances);
     await dbPost('import_log', { filename, row_count: newTx.length });
-    await snapshotInvestmentBalances();
     toast(`✅ ${newTx.length} transactions imported`);
     cancelImport();
     loadImportLog();
