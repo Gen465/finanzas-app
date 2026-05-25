@@ -2391,7 +2391,11 @@ async function connectOneDrive() {
     const res = await app.loginPopup({ scopes: OD_SCOPES });
     app.setActiveAccount(res.account);
     await initOneDrive();
-  } catch(e) { toast('OneDrive login cancelled'); }
+  } catch(e) {
+    const msg = e.errorCode || e.message || String(e);
+    toast('Login error: ' + msg);
+    console.error('MSAL error:', e);
+  }
 }
 
 async function refreshLatestFileName(token) {
