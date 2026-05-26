@@ -1662,19 +1662,71 @@ async function loadBalances() {
   const el = document.getElementById('balContent');
   el.innerHTML = '<div class="spinner"></div>';
   try {
-    const accounts = await dbGet('accounts', '?select=name,balance,last_updated');
+    const now    = new Date();
+    const curMk  = monthKey(now.getMonth(), now.getFullYear());
+
+    // Last 2 complete months (dynamic)
+    const histMks = [1, 2].map(i => {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      return monthKey(d.getMonth(), d.getFullYear());
+    });
+    const fetchMks = [curMk, ...histMks];
+
+    const [accounts, recentTx] = await Promise.all([
+      dbGet('accounts', '?select=name,balance,last_updated'),
+      dbGet('transactions', `?month_year=in.(${fetchMks.join(',')})&select=type,from_account,category,amount,month_year`).catch(() => [])
+    ]);
+
     const acctMap  = {};
     accounts.forEach(a => { acctMap[a.name] = a; });
     const netWorth = accounts.reduce((s, a) => s + +a.balance, 0);
     const asOf     = accounts.map(a => a.last_updated).filter(Boolean).sort().pop() || null;
 
+    // Net change per account per month (income/transfers_in = +, expense/transfers_out = -)
+    const netChange = {};
+    fetchMks.forEach(mk => { netChange[mk] = {}; });
+    const acctsSeen = new Set();
+    recentTx.forEach(r => {
+      const mk = r.month_year;
+      if (!netChange[mk]) return;
+      const amt = +r.amount;
+      if (r.type === 'Income' && r.from_account) {
+        netChange[mk][r.from_account] = (netChange[mk][r.from_account] || 0) + amt;
+        acctsSeen.add(r.from_account);
+      } else if (r.type === 'Expense' && r.from_account) {
+        netChange[mk][r.from_account] = (netChange[mk][r.from_account] || 0) - amt;
+        acctsSeen.add(r.from_account);
+      } else if (r.type === 'Transfer') {
+        if (r.from_account) { netChange[mk][r.from_account] = (netChange[mk][r.from_account] || 0) - amt; acctsSeen.add(r.from_account); }
+        if (r.category)     { netChange[mk][r.category]     = (netChange[mk][r.category]     || 0) + amt; acctsSeen.add(r.category); }
+      }
+    });
+
+    // Reconstruct historical balance per account by walking back from current
+    const histBal = {}; // histBal[acctName][mk]
+    accounts.forEach(a => {
+      if (!acctsSeen.has(a.name)) return; // skip accounts with no transactions
+      histBal[a.name] = {};
+      let bal = +a.balance;
+      bal -= (netChange[curMk][a.name] || 0);
+      histBal[a.name][histMks[0]] = bal;
+      bal -= (netChange[histMks[0]][a.name] || 0);
+      histBal[a.name][histMks[1]] = bal;
+    });
+
     const groupCards = NW_GROUPS.map(group => {
       const grpAccounts = group.accounts.map(n => acctMap[n]).filter(Boolean);
       const grpTotal = grpAccounts.reduce((s, a) => s + +a.balance, 0);
       const rows = grpAccounts.map(a => {
-        const bal    = +a.balance;
-        const isNeg  = bal < 0;
+        const bal      = +a.balance;
+        const isNeg    = bal < 0;
         const isManual = MANUAL_ACCOUNTS.includes(a.name);
+        const hBal     = histBal[a.name];
+        const histLine = hBal
+          ? histMks.filter(mk => hBal[mk] !== undefined)
+              .map(mk => `<span>${mk.split('-')[0]}: ${fmt(hBal[mk], 0)}</span>`)
+              .join(' · ')
+          : '';
         return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border)">
           <div>
             <div style="font-size:0.85rem;font-weight:500;color:var(--text)">${a.name}</div>
@@ -1682,7 +1734,10 @@ async function loadBalances() {
               ${a.last_updated || 'never synced'}${isManual ? ' · manual' : ''}
             </div>
           </div>
-          <div class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${isNeg?'var(--red)':'var(--text)'}">${fmt(bal,2)}</div>
+          <div style="text-align:right">
+            <div class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${isNeg?'var(--red)':'var(--text)'}">${fmt(bal,2)}</div>
+            ${histLine ? `<div class="nw-blur-val" style="font-size:0.65rem;color:var(--muted);margin-top:2px;font-variant-numeric:tabular-nums">${histLine}</div>` : ''}
+          </div>
         </div>`;
       }).join('');
 
