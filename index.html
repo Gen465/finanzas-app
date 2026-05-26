@@ -2702,10 +2702,11 @@ async function loadMortgage() {
     const todayMk = monthKey(now.getMonth(), now.getFullYear());
     const yr     = yy(activeYear);
 
-    const [accounts, txMtg] = await Promise.all([
+    const [accounts, txMtg, evts] = await Promise.all([
       dbGet('accounts', '?select=name,balance'),
       // Fetch all years so the table and projection have full history
-      dbGet('transactions', '?category=like.Mortgage%25&select=amount,category,month_year')
+      dbGet('transactions', '?category=like.Mortgage%25&select=amount,category,month_year'),
+      dbGet('mortgage_events', '?order=effective_from.asc').catch(() => [])
     ]);
 
     const acctMapM = {};
@@ -2748,10 +2749,18 @@ async function loadMortgage() {
     const amortR   = (lastPay && mtgBal > 0) ? lastPay.i / (mtgBal + lastPay.p) : 0;
     const amortPmt = lastPay ? (lastPay.i + lastPay.p) : 0;
 
-    // New rate/payment from June 2026 onwards (rate renegotiated to 3.77%, payment €3,003)
-    const NEW_RATE_PMT_START = new Date(2026, 5, 1); // June 2026
-    const NEW_MONTHLY_RATE   = 0.0377 / 12;          // 0.003142
-    const NEW_PMT            = 3003;
+    // Rate and house-value events from DB (sorted asc by effective_from)
+    const rateEvents = evts.filter(e => e.type === 'rate');
+    const hvEvents   = evts.filter(e => e.type === 'house_value');
+
+    // Returns the latest rate event effective on or before date d
+    function evtRateFor(d) {
+      let r = null;
+      for (const ev of rateEvents) {
+        if (new Date(ev.effective_from + 'T00:00:00') <= d) r = ev; else break;
+      }
+      return r;
+    }
 
     // Project next 6 months via amortisation formula
     const futureRows = [];
@@ -2761,11 +2770,11 @@ async function loadMortgage() {
         const fd  = new Date(now.getFullYear(), now.getMonth() + i, 1);
         const fmk = monthKey(fd.getMonth(), fd.getFullYear());
         if (mBreak[fmk]) continue; // already have real data for this month
-        const useNew  = fd >= NEW_RATE_PMT_START;
-        const projR   = useNew ? NEW_MONTHLY_RATE : amortR;
-        const projPmt = useNew ? NEW_PMT          : amortPmt;
+        const ev     = evtRateFor(fd);
+        const projR  = ev ? ev.value / 12 : amortR;
+        const projPt = (ev && ev.payment != null) ? ev.payment : amortPmt;
         const fi = projBal * projR;
-        const fp = projPmt - fi;
+        const fp = projPt - fi;
         projBal  = Math.max(0, projBal - fp);
         futureRows.push({ mk: fmk, i: fi, p: fp, bal: projBal, projected: true });
       }
@@ -2774,15 +2783,16 @@ async function loadMortgage() {
     // Project when LTV will hit 65% (house value held constant)
     let ltv65Date = null;
     const ltv65Target = 0.65 * houseVal;
-    if (houseVal > 0 && amortR > 0 && amortPmt > 0) {
+    if (houseVal > 0 && (amortR > 0 || rateEvents.length)) {
       if (mtgBal <= ltv65Target) {
         ltv65Date = 'Already achieved';
       } else {
         let pb = mtgBal;
         for (let i = 1; i <= 360; i++) { // cap at 30 years
           const fd2 = new Date(now.getFullYear(), now.getMonth() + i, 1);
-          const r2  = fd2 >= NEW_RATE_PMT_START ? NEW_MONTHLY_RATE : amortR;
-          const p2  = fd2 >= NEW_RATE_PMT_START ? NEW_PMT          : amortPmt;
+          const ev2 = evtRateFor(fd2);
+          const r2  = ev2 ? ev2.value / 12 : amortR;
+          const p2  = (ev2 && ev2.payment != null) ? ev2.payment : amortPmt;
           pb = Math.max(0, pb - (p2 - pb * r2));
           if (pb <= ltv65Target) {
             ltv65Date = MONTHS_ES[fd2.getMonth()] + '-' + String(fd2.getFullYear()).slice(2);
@@ -2797,6 +2807,84 @@ async function loadMortgage() {
     const THL = TH + ';text-align:left';
     const TD = 'padding:7px 8px;border-bottom:1px solid var(--border);font-size:0.8rem;font-variant-numeric:tabular-nums;text-align:right';
     const TDL = TD + ';text-align:left';
+
+    // ── Tracker tables ──
+    // Format effective_from date string → "Jun-26"
+    function fmtEvtDate(s) {
+      const d = new Date(s + 'T00:00:00');
+      return MONTHS_ES[d.getMonth()] + '-' + String(d.getFullYear()).slice(2);
+    }
+    // "Until" = month before the next event starts, or "—" if last
+    function untilLabel(arr, idx) {
+      const nxt = arr[idx + 1];
+      if (!nxt) return '—';
+      const d = new Date(nxt.effective_from + 'T00:00:00');
+      const prev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
+      return MONTHS_ES[prev.getMonth()] + '-' + String(prev.getFullYear()).slice(2);
+    }
+
+    const btnStyle = 'background:none;border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:0.72rem;cursor:pointer;color:var(--muted)';
+
+    const rateRows = rateEvents.map((ev, i) => `
+      <tr>
+        <td style="${TDL}">${fmtEvtDate(ev.effective_from)}</td>
+        <td style="${TD}">${untilLabel(rateEvents, i)}</td>
+        <td style="${TD};font-weight:600">${(ev.value * 100).toFixed(2)}%</td>
+        <td style="${TD}">${ev.payment != null ? fmt(ev.payment, 2) : '—'}</td>
+        <td style="${TDL};color:var(--muted);font-size:0.73rem">${ev.notes || ''}</td>
+      </tr>`).join('');
+
+    const hvRows = hvEvents.map((ev, i) => {
+      const prev = hvEvents[i - 1];
+      const delta = prev ? ((ev.value - prev.value) / prev.value * 100) : null;
+      const dColor = delta === null ? '' : delta >= 0 ? 'var(--green)' : 'var(--red)';
+      const dStr   = delta === null ? '—' : (delta >= 0 ? '+' : '') + delta.toFixed(1) + '%';
+      return `<tr>
+        <td style="${TDL}">${fmtEvtDate(ev.effective_from)}</td>
+        <td style="${TD}">${untilLabel(hvEvents, i)}</td>
+        <td style="${TD};font-weight:600">${fmt(ev.value, 0)}</td>
+        <td style="${TD};color:${dColor}">${dStr}</td>
+        <td style="${TDL};color:var(--muted);font-size:0.73rem">${ev.notes || ''}</td>
+      </tr>`;
+    }).join('');
+
+    const noRow = (cols) => `<tr><td colspan="${cols}" style="${TD};text-align:center;color:var(--muted)">None logged yet</td></tr>`;
+
+    const rateTrackerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <div class="section-label" style="margin-bottom:0">Rate History</div>
+        <button style="${btnStyle}" onclick="logMortgageEvent('rate')">+ Log change</button>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden;margin-bottom:12px">
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;min-width:300px">
+            <thead><tr>
+              <th style="${THL}">From</th><th style="${TH}">Until</th>
+              <th style="${TH}">Rate</th><th style="${TH}">Payment</th>
+              <th style="${THL}">Notes</th>
+            </tr></thead>
+            <tbody>${rateRows || noRow(5)}</tbody>
+          </table>
+        </div>
+      </div>`;
+
+    const hvTrackerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <div class="section-label" style="margin-bottom:0">House Value History</div>
+        <button style="${btnStyle}" onclick="logMortgageEvent('house_value')">+ Log change</button>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden;margin-bottom:12px">
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;min-width:300px">
+            <thead><tr>
+              <th style="${THL}">From</th><th style="${TH}">Until</th>
+              <th style="${TH}">Value</th><th style="${TH}">Δ</th>
+              <th style="${THL}">Notes</th>
+            </tr></thead>
+            <tbody>${hvRows || noRow(5)}</tbody>
+          </table>
+        </div>
+      </div>`;
 
     const actualRows = sortedMks.map(mk => {
       const { i, p } = mBreak[mk];
@@ -2905,10 +2993,40 @@ async function loadMortgage() {
             </tbody>
           </table>
         </div>
-      </div>` : ''}`;
+      </div>` : ''}
+      ${rateTrackerHTML}
+      ${hvTrackerHTML}`;
   } catch(e) {
     el.innerHTML = `<div class="placeholder"><div class="icon">⚠️</div><h2>Error</h2><p>${e.message}</p></div>`;
   }
+}
+
+async function logMortgageEvent(type) {
+  const label = type === 'rate' ? 'Rate' : 'House Value';
+  const dateStr = window.prompt(`${label} change — effective from (YYYY-MM-DD):`, new Date().toISOString().split('T')[0]);
+  if (!dateStr) return;
+  let value, payment = null, notes;
+  if (type === 'rate') {
+    const rStr = window.prompt('Annual interest rate (e.g. 3.77):', '');
+    if (!rStr) return;
+    value = parseFloat(rStr.replace(',', '.')) / 100;
+    if (isNaN(value)) { toast('Invalid rate'); return; }
+    const pStr = window.prompt('New monthly payment € (leave blank if unchanged):', '');
+    payment = pStr ? parseFloat(pStr.replace(',', '.')) : null;
+    if (pStr && isNaN(payment)) { toast('Invalid payment'); return; }
+    notes = window.prompt('Notes (optional):', '') || null;
+  } else {
+    const vStr = window.prompt('House value €:', '');
+    if (!vStr) return;
+    value = parseFloat(vStr.replace(/[^0-9.,]/g, '').replace(',', '.'));
+    if (isNaN(value)) { toast('Invalid value'); return; }
+    notes = window.prompt('Notes (optional):', '') || null;
+  }
+  try {
+    await dbPost('mortgage_events', [{ type, value, effective_from: dateStr, payment, notes }]);
+    toast(`${label} change logged ✓`);
+    loadMortgage();
+  } catch(e) { toast('Error: ' + e.message); }
 }
 
 // ── Seed initial data (runs once when tables are empty) ─────────────────────
