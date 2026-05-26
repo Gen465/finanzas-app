@@ -3263,6 +3263,7 @@ async function importFromOneDrive() {
     for (let i = 0; i < newTx.length; i += 100)
       await dbPost('transactions', newTx.slice(i, i+100));
     await updateAccountBalances(balances);
+    await syncMortgagePrincipal(newTx);
     await dbPost('import_log', { filename: info.name, row_count: newTx.length });
     toast(`✅ ${newTx.length} new transactions imported`);
     latestEl.textContent = `Latest: ${info.name}`;
@@ -3435,6 +3436,7 @@ async function confirmImport() {
     for (let i = 0; i < newTx.length; i += 100)
       await dbPost('transactions', newTx.slice(i, i+100));
     await updateAccountBalances(balances);
+    await syncMortgagePrincipal(newTx);
     await dbPost('import_log', { filename, row_count: newTx.length });
     toast(`✅ ${newTx.length} transactions imported`);
     cancelImport();
@@ -3450,6 +3452,19 @@ async function updateAccountBalances(balances) {
   for (const b of balances)
     await dbPatch('accounts', `?name=eq.${encodeURIComponent(b.name)}`,
       { balance: b.balance, last_updated: new Date().toISOString().split('T')[0] });
+}
+
+// After every import, reduce Mortgage Principal balance by any principal payments in newTx
+async function syncMortgagePrincipal(newTx) {
+  const paid = newTx
+    .filter(t => t.category === 'Mortgage Principal' && t.type === 'Expense')
+    .reduce((s, t) => s + +t.amount, 0);
+  if (!paid) return;
+  const rows = await dbGet('accounts', '?name=eq.Mortgage Principal&select=balance').catch(() => []);
+  if (!rows.length) return;
+  const newBal = +rows[0].balance + paid; // liability is negative, paid reduces it toward 0
+  await dbPatch('accounts', '?name=eq.Mortgage%20Principal',
+    { balance: newBal, last_updated: new Date().toISOString().split('T')[0] });
 }
 
 async function updateBalancesOnly() {
