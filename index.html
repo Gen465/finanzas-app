@@ -534,7 +534,9 @@ let txMonth    = new Date().getMonth();
 let txTypes       = [];        // empty = show all
 let txCatF        = '';
 let txAcctF       = '';
-let txMultiMonths = new Set(); // month keys selected in stripe; empty = single month mode
+let txMultiMonths    = new Set(); // month keys selected in stripe; empty = single month mode
+let txStripeCount    = 4;         // visible months in stripe (expands left one at a time)
+let txAvailableMonths = null;     // distinct month_year values from DB, cached
 
 const ACCT_SHORT = {
   'Debito ING':    'ING',
@@ -1902,17 +1904,22 @@ async function loadTransactions() {
     const expense      = allTxs.filter(r => r.type === 'Expense').reduce((s, r) => s + +r.amount, 0);
     const net          = cashIncomeTx - expense;
 
-    // ── Month stripe (newest on left) ──────────────────────────────────────
-    const now2       = new Date();
-    const stripeMonths = Array.from({length: 13}, (_, i) => {
-      const d = new Date(now2.getFullYear(), now2.getMonth() - i, 1);
-      return monthKey(d.getMonth(), d.getFullYear());
-    }); // newest first
+    // ── Month stripe — oldest→newest, anchored at curMk, progressive left expansion ──
+    if (!txAvailableMonths) {
+      const mRows = await dbGet('transactions', '?select=month_year&order=month_year.asc');
+      txAvailableMonths = [...new Set(mRows.map(r => r.month_year))].sort(mkSort);
+    }
+    const curIdx   = txAvailableMonths.indexOf(curMk);
+    const endIdx   = curIdx >= 0 ? curIdx : txAvailableMonths.length - 1;
+    const startIdx = Math.max(0, endIdx - txStripeCount + 1);
+    const stripeMonths = txAvailableMonths.slice(startIdx, endIdx + 1); // oldest→newest
+    const canExpand    = startIdx > 0;
 
     const CHIP = 'flex-shrink:0;padding:4px 9px;border-radius:14px;font-size:0.7rem;font-weight:600;cursor:pointer;border:1.5px solid;-webkit-tap-highlight-color:transparent;font-family:var(--font)';
     const stripe = `
       <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin-bottom:12px">
         <div style="display:flex;gap:5px;padding:2px 1px">
+          ${canExpand ? `<button onclick="txStripeCount++;loadTransactions()" style="${CHIP};background:transparent;border-color:var(--border);color:var(--muted)" title="Show older">‹</button>` : ''}
           ${stripeMonths.map(smk => {
             const sel = txMultiMonths.has(smk);
             const cur = smk === curMk && !multiActive;
@@ -1921,7 +1928,7 @@ async function loadTransactions() {
                        :       `${CHIP};background:transparent;border-color:var(--border);color:var(--muted)`;
             return `<button onclick="toggleTxMonth('${smk}')" style="${st}">${smk}</button>`;
           }).join('')}
-          ${multiActive ? `<button onclick="txMultiMonths.clear();loadTransactions()" style="${CHIP};background:transparent;border-color:var(--border);color:var(--muted);margin-left:4px">✕</button>` : ''}
+          ${multiActive ? `<button onclick="txMultiMonths.clear();loadTransactions()" style="${CHIP};background:transparent;border-color:var(--border);color:var(--muted);margin-left:2px">✕</button>` : ''}
         </div>
       </div>`;
 
@@ -2012,9 +2019,34 @@ async function loadTransactions() {
       </div>
       ${typepills}
       <div style="display:flex;gap:8px;margin-bottom:12px">${acctSel}${catSel}</div>
-      ${txs.length
-        ? `<div class="card" style="padding:0 0 0 0;overflow:hidden">${rows}</div>
-           <div style="text-align:center;color:var(--muted);font-size:0.76rem;margin-top:8px;padding-bottom:4px">${txs.length} of ${allTxs.length} transactions</div>`
+      ${txs.length ? (() => {
+        // ── Summary card ──────────────────────────────────────────────────
+        const fExp  = txs.filter(r => r.type === 'Expense').reduce((s,r) => s + +r.amount, 0);
+        const fInc  = txs.filter(r => r.type === 'Income').reduce((s,r) => s + +r.amount, 0);
+        const fTrf  = txs.filter(r => r.type === 'Transfer').reduce((s,r) => s + +r.amount, 0);
+        const fNet  = fInc - fExp;
+        const ctxParts = [];
+        if (multiActive) ctxParts.push(titleStr); else ctxParts.push(curMk);
+        if (txAcctF) ctxParts.push(ACCT_SHORT[txAcctF] || txAcctF);
+        if (txCatF)  ctxParts.push(txCatF);
+        if (txTypes.length === 1) ctxParts.push(txTypes[0]);
+        const R = 'display:flex;justify-content:space-between;align-items:baseline;padding:5px 0';
+        const summaryCard = `
+          <div class="card" style="margin-top:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+              <span style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted)">${txs.length} transactions</span>
+              <span style="font-size:0.68rem;color:var(--muted)">${ctxParts.join(' · ')}</span>
+            </div>
+            ${fExp ? `<div style="${R}"><span style="font-size:0.82rem;color:var(--muted)">Expenses</span><span style="font-size:0.9rem;font-weight:700;color:var(--red);font-variant-numeric:tabular-nums">-${fmt(fExp,2)}</span></div>` : ''}
+            ${fInc ? `<div style="${R}"><span style="font-size:0.82rem;color:var(--muted)">Income</span><span style="font-size:0.9rem;font-weight:700;color:var(--green);font-variant-numeric:tabular-nums">+${fmt(fInc,2)}</span></div>` : ''}
+            ${fTrf ? `<div style="${R}"><span style="font-size:0.82rem;color:var(--muted)">Transfers</span><span style="font-size:0.9rem;font-weight:700;color:#8b5cf6;font-variant-numeric:tabular-nums">${fmt(fTrf,2)}</span></div>` : ''}
+            <div style="${R};border-top:1px solid var(--border);margin-top:4px;padding-top:8px">
+              <span style="font-size:0.88rem;font-weight:700;color:var(--text)">Net</span>
+              <span style="font-size:1rem;font-weight:800;color:${fNet>=0?'var(--green)':'var(--red)'};font-variant-numeric:tabular-nums">${fNet>=0?'+':''}${fmt(fNet,2)}</span>
+            </div>
+          </div>`;
+        return `<div class="card" style="padding:0;overflow:hidden">${rows}</div>${summaryCard}`;
+      })()
         : `<div class="card" style="text-align:center;color:var(--muted);padding:32px">
              <div style="font-size:1.8rem;margin-bottom:8px">📭</div>
              <div style="font-weight:600;color:var(--text)">No transactions match filters</div>
@@ -2026,12 +2058,12 @@ async function loadTransactions() {
 }
 
 function prevTxMonth() {
-  txMultiMonths.clear();
+  txMultiMonths.clear(); txStripeCount = 4;
   if (txMonth > 0) txMonth--; else { txMonth = 11; txYear--; }
   loadTransactions();
 }
 function nextTxMonth() {
-  txMultiMonths.clear();
+  txMultiMonths.clear(); txStripeCount = 4;
   if (txMonth < 11) txMonth++; else { txMonth = 0; txYear++; }
   loadTransactions();
 }
