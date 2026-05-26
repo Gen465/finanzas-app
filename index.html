@@ -1716,38 +1716,86 @@ async function loadBalances() {
 
     const groupCards = NW_GROUPS.map(group => {
       const grpAccounts = group.accounts.map(n => acctMap[n]).filter(Boolean);
-      const grpTotal = grpAccounts.reduce((s, a) => s + +a.balance, 0);
-      const rows = grpAccounts.map(a => {
-        const bal      = +a.balance;
-        const isNeg    = bal < 0;
-        const isManual = MANUAL_ACCOUNTS.includes(a.name);
-        const hBal     = histBal[a.name];
-        const histLine = hBal
-          ? histMks.filter(mk => hBal[mk] !== undefined)
-              .map(mk => `<span>${mk.split('-')[0]}: ${fmt(hBal[mk], 0)}</span>`)
-              .join(' · ')
-          : '';
-        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border)">
-          <div>
-            <div style="font-size:0.85rem;font-weight:500;color:var(--text)">${a.name}</div>
-            <div style="font-size:0.68rem;color:var(--muted);margin-top:1px">
-              ${a.last_updated || 'never synced'}${isManual ? ' · manual' : ''}
+      const grpTotal    = grpAccounts.reduce((s, a) => s + +a.balance, 0);
+
+      // Home Equity: simple card, no historical table
+      if (group.label === 'Home Equity') {
+        const rows = grpAccounts.map(a => {
+          const bal = +a.balance; const isNeg = bal < 0;
+          const isManual = MANUAL_ACCOUNTS.includes(a.name);
+          return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border)">
+            <div>
+              <div style="font-size:0.85rem;font-weight:500;color:var(--text)">${a.name}</div>
+              <div style="font-size:0.68rem;color:var(--muted);margin-top:1px">${a.last_updated||'never synced'}${isManual?' · manual':''}</div>
             </div>
-          </div>
-          <div style="text-align:right">
             <div class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${isNeg?'var(--red)':'var(--text)'}">${fmt(bal,2)}</div>
-            ${histLine ? `<div class="nw-blur-val" style="font-size:0.65rem;color:var(--muted);margin-top:2px;font-variant-numeric:tabular-nums">${histLine}</div>` : ''}
-          </div>
-        </div>`;
+          </div>`;
+        }).join('');
+        return `
+          <div class="card" style="padding:0;margin-bottom:12px;overflow:hidden">
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:11px 16px;background:${group.color}18;border-bottom:1px solid ${group.color}33">
+              <span style="font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:${group.color}">${group.label}</span>
+              <span class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${grpTotal<0?'var(--red)':group.color}">${fmt(grpTotal,2)}</span>
+            </div>
+            ${rows}
+          </div>`;
+      }
+
+      // Cash / Savings / Investments: table layout with historical columns
+      // histMks = [1-mo-ago, 2-mo-ago]; display order: older → newer → Now
+      const colMks = [...histMks].reverse(); // [2-mo-ago, 1-mo-ago]
+
+      const thStyle  = 'text-align:right;font-size:0.72rem;font-weight:600;color:var(--muted);padding:5px 10px;white-space:nowrap';
+      const thStyleL = 'text-align:left;font-size:0.72rem;font-weight:600;color:var(--muted);padding:5px 10px 5px 16px';
+
+      const headerRow = `<tr style="border-bottom:1px solid var(--border)">
+        <th style="${thStyleL}">Account</th>
+        ${colMks.map(mk => `<th style="${thStyle}">${mk}</th>`).join('')}
+        <th style="${thStyle};padding-right:16px">Now</th>
+      </tr>`;
+
+      const dataRows = grpAccounts.map((a, i) => {
+        const bal    = +a.balance;
+        const isNeg  = bal < 0;
+        const hBal   = histBal[a.name];
+        const rowBg  = i % 2 === 1 ? 'background:var(--bg)' : '';
+        const histCells = colMks.map(mk => {
+          const v = hBal?.[mk];
+          return `<td class="nw-blur-val" style="text-align:right;font-size:0.8rem;font-variant-numeric:tabular-nums;color:var(--muted);padding:7px 10px;white-space:nowrap">${v !== undefined ? fmt(v, 0) : '—'}</td>`;
+        }).join('');
+        return `<tr style="${rowBg}">
+          <td style="font-size:0.82rem;font-weight:500;color:var(--text);padding:7px 10px 7px 16px">${a.name}</td>
+          ${histCells}
+          <td class="nw-blur-val" style="text-align:right;font-size:0.84rem;font-weight:700;font-variant-numeric:tabular-nums;color:${isNeg?'var(--red)':'var(--text)'};padding:7px 16px 7px 10px;white-space:nowrap">${fmt(bal, 0)}</td>
+        </tr>`;
+      }).join('');
+
+      const tfStyle  = `border-top:1px solid ${group.color}44;background:${group.color}08`;
+      const histTotals = colMks.map(mk => {
+        const vals = grpAccounts.map(a => histBal[a.name]?.[mk]).filter(v => v !== undefined);
+        const sum  = vals.reduce((s, v) => s + v, 0);
+        return `<td class="nw-blur-val" style="text-align:right;font-size:0.82rem;font-weight:700;font-variant-numeric:tabular-nums;color:${group.color};padding:7px 10px;white-space:nowrap;${tfStyle}">${vals.length ? fmt(sum, 0) : '—'}</td>`;
       }).join('');
 
       return `
         <div class="card" style="padding:0;margin-bottom:12px;overflow:hidden">
           <div style="display:flex;align-items:center;justify-content:space-between;padding:11px 16px;background:${group.color}18;border-bottom:1px solid ${group.color}33">
             <span style="font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:${group.color}">${group.label}</span>
-            <span class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${grpTotal<0?'var(--red)':group.color}">${fmt(grpTotal,2)}</span>
+            <span class="nw-blur-val" style="font-size:0.92rem;font-weight:700;font-variant-numeric:tabular-nums;color:${grpTotal<0?'var(--red)':group.color}">${fmt(grpTotal, 0)}</span>
           </div>
-          ${rows}
+          <div style="overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse">
+              <thead>${headerRow}</thead>
+              <tbody>${dataRows}</tbody>
+              <tfoot>
+                <tr>
+                  <td style="font-size:0.82rem;font-weight:700;color:${group.color};padding:7px 10px 7px 16px;${tfStyle}">Total</td>
+                  ${histTotals}
+                  <td class="nw-blur-val" style="text-align:right;font-size:0.84rem;font-weight:700;font-variant-numeric:tabular-nums;color:${grpTotal<0?'var(--red)':group.color};padding:7px 16px 7px 10px;white-space:nowrap;${tfStyle}">${fmt(grpTotal, 0)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
         </div>`;
     }).join('');
 
