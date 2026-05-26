@@ -3024,8 +3024,14 @@ async function logMortgageEvent(type) {
   }
   try {
     await dbPost('mortgage_events', [{ type, value, effective_from: dateStr, payment, notes }]);
+    // Keep accounts.House in sync so NW / Balances tab stays accurate
+    if (type === 'house_value') {
+      await dbPatch('accounts', '?name=eq.House', { balance: value, last_updated: dateStr }).catch(() => {});
+    }
     toast(`${label} change logged ✓`);
     loadMortgage();
+    if (activeTab === 'balances')  loadBalances();
+    if (activeTab === 'settings')  loadImportLog();
   } catch(e) { toast('Error: ' + e.message); }
 }
 
@@ -3472,22 +3478,29 @@ async function loadImportLog() {
 
     // Manual balances section
     const manualAccts = accounts.filter(a => MANUAL_ACCOUNTS.includes(a.name));
-    const manualRows = manualAccts.map(a => `
+    const manualRows = manualAccts.map(a => {
+      const isHouse = a.name === 'House';
+      const btnAction = isHouse
+        ? `logMortgageEvent('house_value')`
+        : `editAccountBalance('${a.name.replace(/'/g, "\\'")}', ${+a.balance})`;
+      const btnLabel = isHouse ? 'Log change' : 'Edit';
+      return `
       <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border)">
         <div>
           <div style="font-size:0.85rem;font-weight:500;color:var(--text)">${a.name}</div>
-          <div style="font-size:0.68rem;color:var(--muted)">${a.last_updated || 'never updated'}</div>
+          <div style="font-size:0.68rem;color:var(--muted)">${a.last_updated || 'never updated'}${isHouse ? ' · history tracked in Mortgage tab' : ''}</div>
         </div>
         <div style="display:flex;align-items:center;gap:10px">
           <div style="font-size:0.9rem;font-weight:700;font-variant-numeric:tabular-nums">${fmt(+a.balance,2)}</div>
-          <button onclick="editAccountBalance('${a.name.replace(/'/g, "\\'")}', ${+a.balance})"
-            style="background:none;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-size:0.72rem;padding:4px 8px;font-family:var(--font)">Edit</button>
+          <button onclick="${btnAction}"
+            style="background:none;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;font-size:0.72rem;padding:4px 8px;font-family:var(--font)">${btnLabel}</button>
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
 
     const manualSection = `
       <div class="section-label">Manual Balances</div>
-      <div style="font-size:0.7rem;color:var(--muted);margin-bottom:8px;padding:0 2px">These accounts aren't auto-updated from CSV imports.</div>
+      <div style="font-size:0.7rem;color:var(--muted);margin-bottom:8px;padding:0 2px">These accounts aren't auto-updated from CSV imports. Property value changes are logged with full history in the Mortgage tab.</div>
       <div class="card" style="padding:0;margin-bottom:16px;overflow:hidden">
         <div style="padding:10px 16px;background:var(--bg)">
           <span style="font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:0.07em;color:var(--muted)">Property</span>
