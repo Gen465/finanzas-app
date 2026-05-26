@@ -786,26 +786,34 @@ async function loadDashboard() {
       const savColor = savRate === null ? 'var(--muted)' : savRate >= 0 ? 'var(--green)' : 'var(--red)';
       const vsBdgtC  = vsBudget === null ? '' : vsBudget > 1 ? 'var(--red)' : vsBudget > 0.8 ? 'var(--yellow)' : 'var(--green)';
       const statsBar = `
-        <div class="kpi-row" style="grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:14px">
-          <div class="kpi" style="padding:10px 4px">
-            <div class="kpi-label" style="font-size:0.55rem">Spent (ex Mtg)</div>
-            <div class="kpi-value red" style="font-size:0.82rem">${fmt(totalExpExclMtg,0)}</div>
+        <div style="display:flex;flex-direction:column;gap:5px;margin-bottom:14px">
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px">
+            <div class="kpi" style="padding:10px 4px">
+              <div class="kpi-label" style="font-size:0.55rem">Total Spent</div>
+              <div class="kpi-value red" style="font-size:0.82rem">${fmt(totalExpAll,0)}</div>
+            </div>
+            <div class="kpi" style="padding:10px 4px">
+              <div class="kpi-label" style="font-size:0.55rem">Cash Income</div>
+              <div class="kpi-value green" style="font-size:0.82rem">${fmt(cashIncome,0)}</div>
+            </div>
+            <div class="kpi" style="padding:10px 4px">
+              <div class="kpi-label" style="font-size:0.55rem">vs Budget</div>
+              <div class="kpi-value" style="font-size:0.82rem;color:${vsBdgtC}">${vsBudget !== null ? pct(vsBudget) : '—'}</div>
+            </div>
           </div>
-          <div class="kpi" style="padding:10px 4px">
-            <div class="kpi-label" style="font-size:0.55rem">Cash Income</div>
-            <div class="kpi-value green" style="font-size:0.82rem">${fmt(cashIncome,0)}</div>
-          </div>
-          <div class="kpi" style="padding:10px 4px">
-            <div class="kpi-label" style="font-size:0.55rem">Val & Interest</div>
-            <div class="kpi-value" style="font-size:0.82rem;color:#06b6d4">${valIncome ? fmt(valIncome,0) : '—'}</div>
-          </div>
-          <div class="kpi" style="padding:10px 4px">
-            <div class="kpi-label" style="font-size:0.55rem">vs Budget</div>
-            <div class="kpi-value" style="font-size:0.82rem;color:${vsBdgtC}">${vsBudget !== null ? pct(vsBudget) : '—'}</div>
-          </div>
-          <div class="kpi" style="padding:10px 4px">
-            <div class="kpi-label" style="font-size:0.55rem">Savings Rate</div>
-            <div class="kpi-value" style="font-size:0.82rem;color:${savColor}">${savRate !== null ? pct(savRate) : '—'}</div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px">
+            <div class="kpi" style="padding:8px 4px">
+              <div class="kpi-label" style="font-size:0.5rem">ex Mortgage</div>
+              <div class="kpi-value" style="font-size:0.75rem;color:var(--red)">${fmt(totalExpExclMtg,0)}</div>
+            </div>
+            <div class="kpi" style="padding:8px 4px">
+              <div class="kpi-label" style="font-size:0.5rem">Val & Interest</div>
+              <div class="kpi-value" style="font-size:0.75rem;color:#06b6d4">${valIncome ? fmt(valIncome,0) : '—'}</div>
+            </div>
+            <div class="kpi" style="padding:8px 4px">
+              <div class="kpi-label" style="font-size:0.5rem">Savings Rate</div>
+              <div class="kpi-value" style="font-size:0.75rem;color:${savColor}">${savRate !== null ? pct(savRate) : '—'}</div>
+            </div>
           </div>
         </div>`;
 
@@ -979,15 +987,16 @@ async function loadDashboard() {
              </div>`
           : statsBar + top10Card + catSummaryCard + otrosCard + dailyCard}`;
 
-      if (hasData) renderDailyChart(mDays, dailyData, cumDailyData, daysElapsed);
+      if (hasData) renderDailyChart(mDays, dailyData, cumDailyData, daysElapsed, totalBudget, daysInMonth);
       applyNWBlur();
 
     } else if (dashView === 'wealth') {
       await loadWealthView(el, heroCard, viewToggle, acctMap, accounts);
     } else {
-      const [txInc, txExp] = await Promise.all([
+      const [txInc, txExp, budgetHistory] = await Promise.all([
         dbGet('transactions', `?type=eq.Income&month_year=like.*-${yr}&select=amount,month_year,category,sub_category`),
-        dbGet('transactions', `?type=eq.Expense&month_year=like.*-${yr}&select=amount,month_year,category`)
+        dbGet('transactions', `?type=eq.Expense&month_year=like.*-${yr}&select=amount,month_year,category`),
+        dbGet('budget_history', `?year=eq.${activeYear}&order=effective_from.asc`).catch(() => [])
       ]);
 
       const totalInc = txInc.reduce((s, r) => s + +r.amount, 0);
@@ -1134,6 +1143,67 @@ async function loadDashboard() {
           <div class="card-title">Income vs Expenses · ${activeYear}</div>
           <div style="position:relative;height:200px"><canvas id="monthCanvas"></canvas></div>
         </div>
+
+        ${(() => {
+          // Compute effective total budget at end of a given month
+          const mkNum = mk2 => {
+            const [mo, y2] = mk2.split('-');
+            return (2000 + parseInt(y2)) * 12 + MONTHS_ES.indexOf(mo);
+          };
+          const nowMk    = monthKey(new Date().getMonth(), new Date().getFullYear());
+          const nowNum   = mkNum(nowMk);
+          const currentTotalBudget = CAT_GROUPS.reduce((s, g) => {
+            const catSum = g.cats.reduce((cs, c) => cs + (budgetMap[c] || 0), 0);
+            return s + (catSum > 0 ? catSum : (budgetMap['_grp_' + g.label] || 0));
+          }, 0);
+
+          const effectiveBudget = endDate => {
+            const rel = budgetHistory.filter(r => r.effective_from <= endDate);
+            if (!rel.length) return currentTotalBudget;
+            const catLatest = {};
+            rel.forEach(r => {
+              if (!catLatest[r.category] || r.effective_from > catLatest[r.category].effective_from)
+                catLatest[r.category] = r;
+            });
+            const hMap = {};
+            Object.values(catLatest).forEach(r => { hMap[r.category] = +r.monthly_budget; });
+            return CAT_GROUPS.reduce((s, g) => {
+              const catSum = g.cats.reduce((cs, c) => cs + (hMap[c] || 0), 0);
+              return s + (catSum > 0 ? catSum : (hMap['_grp_' + g.label] || 0));
+            }, 0);
+          };
+
+          const dots = MONTHS_ES.map(mo => {
+            const mk2  = mo + '-' + yr;
+            const mn   = mkNum(mk2);
+            const mi   = MONTHS_ES.indexOf(mo);
+            const fy   = activeYear;
+            const lastD = new Date(fy, mi + 1, 0).getDate();
+            const endD  = fy + '-' + String(mi+1).padStart(2,'0') + '-' + String(lastD).padStart(2,'0');
+            const spent = nmTotal[mk2] || 0;
+            const isFut = mn > nowNum;
+            const isCur = mn === nowNum;
+            const noData = !activeMonths.includes(mk2);
+            let bg, border;
+            if (isFut || noData) {
+              bg = 'var(--border)'; border = 'var(--border)';
+            } else if (isCur) {
+              bg = 'rgba(249,115,22,0.18)'; border = '#f97316';
+            } else {
+              const eff = effectiveBudget(endD);
+              const ok  = eff === 0 || spent <= eff;
+              bg = ok ? 'var(--green)' : 'var(--red)';
+              border = bg;
+            }
+            return '<div style="text-align:center;flex:1;min-width:0">' +
+              '<div style="width:26px;height:26px;border-radius:50%;background:' + bg + ';border:2px solid ' + border + ';margin:0 auto"></div>' +
+              '<div style="font-size:0.57rem;color:var(--muted);margin-top:3px;font-weight:600">' + mo + '</div>' +
+              '</div>';
+          }).join('');
+
+          return '<div class="card" style="margin-bottom:12px"><div class="card-title">Budget Adherence · ' + activeYear + '</div>' +
+            '<div style="display:flex;gap:4px;padding:2px 0">' + dots + '</div></div>';
+        })()}
 
         <div class="card">
           <div class="card-title">Net Worth · ${activeYear}</div>
@@ -1511,7 +1581,7 @@ function renderCumChart(months, cumIncData, cumExpData) {
   });
 }
 
-function renderDailyChart(days, dailyData, cumData, daysElapsed) {
+function renderDailyChart(days, dailyData, cumData, daysElapsed, totalBudget, daysInMonth) {
   const canvas = document.getElementById('dailyCanvas');
   if (!canvas) return;
   if (dailyChart) { dailyChart.destroy(); dailyChart = null; }
@@ -1540,7 +1610,19 @@ function renderDailyChart(days, dailyData, cumData, daysElapsed) {
           tension: 0.3,
           yAxisID: 'yCum',
           order: 1
-        }
+        },
+        ...(totalBudget > 0 ? [{
+          type: 'line',
+          label: 'Budget',
+          data: days.map(() => totalBudget),
+          borderColor: '#f97316',
+          borderDash: [5, 4],
+          borderWidth: 1.5,
+          pointRadius: 0,
+          backgroundColor: 'transparent',
+          yAxisID: 'yCum',
+          order: 0
+        }] : [])
       ]
     },
     options: {
@@ -1631,7 +1713,10 @@ async function loadBalances() {
 
     el.innerHTML = `
       <div class="hero-card">
-        <div class="hero-label">Net Worth</div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div class="hero-label">Net Worth</div>
+          <button onclick="toggleNWBlur()" style="background:none;border:none;cursor:pointer;font-size:1.1rem;opacity:0.6;padding:4px;-webkit-tap-highlight-color:transparent" title="Hide/show">👁</button>
+        </div>
         <div class="hero-value nw-blur-val">${fmt(netWorth, 0)}</div>
         ${asOf ? `<div class="hero-sub">last synced ${asOf} · manual accounts updated in Settings</div>` : ''}
       </div>
@@ -1890,6 +1975,8 @@ async function editBudget(category) {
     } else {
       await dbPost('budget_targets', [{ year: activeYear, category, monthly_budget: num }]);
     }
+    const today = new Date().toISOString().split('T')[0];
+    await dbPost('budget_history', [{ year: activeYear, category, monthly_budget: num, effective_from: today }]).catch(() => {});
     toast('Budget updated ✓');
     loadBudget();
   } catch(e) { toast('Error: ' + e.message); }
@@ -1909,6 +1996,8 @@ async function editGroupBudget(groupLabel) {
     } else {
       await dbPost('budget_targets', [{ year: activeYear, category: grpKey, monthly_budget: num }]);
     }
+    const today2 = new Date().toISOString().split('T')[0];
+    await dbPost('budget_history', [{ year: activeYear, category: grpKey, monthly_budget: num, effective_from: today2 }]).catch(() => {});
     toast('Envelope updated ✓');
     loadBudget();
   } catch(e) { toast('Error: ' + e.message); }
