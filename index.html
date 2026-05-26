@@ -531,9 +531,22 @@ let dashView   = 'month';
 let dashMonth  = new Date().getMonth();
 let txYear     = new Date().getFullYear();
 let txMonth    = new Date().getMonth();
-let txTypes    = [];   // empty = show all; array of 'Income','Expense','Transfer'
-let txCatF     = '';
-let txAcctF    = '';
+let txTypes       = [];        // empty = show all
+let txCatF        = '';
+let txAcctF       = '';
+let txMultiMonths = new Set(); // month keys selected in stripe; empty = single month mode
+
+const ACCT_SHORT = {
+  'Debito ING':    'ING',
+  'Debit ABN':     'ABN',
+  'AMEX-TDC':      'AMEX',
+  'TDC - ING':     'TDC',
+  'Apartados ING': 'Apt·ING',
+  'Apartados ABN': 'Apt·ABN',
+  'Trade212':      'T212',
+  'ETFMatic':      'ETF',
+  'Openbank':      'OBank',
+};
 
 const NW_GROUPS = [
   { label:'Cash',        color:'#3b82f6', accounts:['Debito ING','Debit ABN','Apartados ING','Apartados ABN','TDC - ING','AMEX-TDC'] },
@@ -1858,17 +1871,23 @@ async function loadTransactions() {
   if (!el) return;
   el.innerHTML = '<div class="spinner"></div>';
   try {
-    const mk = monthKey(txMonth, txYear);
-    const allTxs = await dbGet('transactions',
-      `?month_year=eq.${mk}&order=date.desc,amount.desc&select=date,type,category,sub_category,amount,from_account,notes`);
+    const curMk      = monthKey(txMonth, txYear);
+    const multiActive = txMultiMonths.size > 0;
+    const fetchMks    = multiActive ? [...txMultiMonths] : [curMk];
+    const qMk         = multiActive
+      ? `month_year=in.(${fetchMks.join(',')})`
+      : `month_year=eq.${curMk}`;
 
-    // build filter options — accounts from data, categories from full CAT_GROUPS definition
-    const uniqueAccts  = [...new Set(allTxs.map(r => r.from_account))].filter(Boolean).sort();
-    const definedCats  = CAT_GROUPS.flatMap(g => g.cats);
-    const txOnlyCats   = [...new Set(
+    const allTxs = await dbGet('transactions',
+      `?${qMk}&order=date.desc,amount.desc&select=date,type,category,sub_category,amount,from_account,notes`);
+
+    // filter options
+    const uniqueAccts = [...new Set(allTxs.map(r => r.from_account))].filter(Boolean).sort();
+    const definedCats = CAT_GROUPS.flatMap(g => g.cats);
+    const txOnlyCats  = [...new Set(
       allTxs.filter(r => r.type !== 'Transfer').map(r => r.category)
     )].filter(c => c && !definedCats.includes(c)).sort();
-    const allCats      = [...definedCats, ...txOnlyCats]; // full list always shown
+    const allCats     = [...definedCats, ...txOnlyCats];
 
     // apply filters
     let txs = allTxs;
@@ -1876,94 +1895,130 @@ async function loadTransactions() {
     if (txAcctF)        txs = txs.filter(r => r.from_account === txAcctF);
     if (txCatF)         txs = txs.filter(r => r.category === txCatF && r.type !== 'Transfer');
 
-    const incomeAll  = allTxs.filter(r => r.type === 'Income');
-    const income     = incomeAll.reduce((s, r) => s + +r.amount, 0);
+    // KPI totals
+    const incomeAll    = allTxs.filter(r => r.type === 'Income');
     const cashIncomeTx = incomeAll.filter(r => r.category !== 'Valuacion' && r.sub_category !== 'Intereses').reduce((s, r) => s + +r.amount, 0);
-    const valIncomeTx  = incomeAll.filter(r => r.category === 'Valuacion' || r.sub_category === 'Intereses').reduce((s, r) => s + +r.amount, 0);
-    const expense = allTxs.filter(r => r.type === 'Expense').reduce((s, r) => s + +r.amount, 0);
-    const net     = cashIncomeTx - expense;
+    const valIncomeTx  = incomeAll.filter(r => r.category === 'Valuacion'  || r.sub_category === 'Intereses').reduce((s, r) => s + +r.amount, 0);
+    const expense      = allTxs.filter(r => r.type === 'Expense').reduce((s, r) => s + +r.amount, 0);
+    const net          = cashIncomeTx - expense;
 
-    // type pill styles
-    const PILL = 'display:inline-flex;align-items:center;padding:5px 12px;border-radius:20px;font-size:0.76rem;font-weight:600;cursor:pointer;border:1.5px solid;-webkit-tap-highlight-color:transparent;transition:all 0.15s';
-    const pillStyle = (t, activeC, borderC) => txTypes.includes(t)
-      ? `${PILL};background:${activeC};border-color:${borderC};color:#fff`
+    // ── Month stripe (newest on left) ──────────────────────────────────────
+    const now2       = new Date();
+    const stripeMonths = Array.from({length: 13}, (_, i) => {
+      const d = new Date(now2.getFullYear(), now2.getMonth() - i, 1);
+      return monthKey(d.getMonth(), d.getFullYear());
+    }); // newest first
+
+    const CHIP = 'flex-shrink:0;padding:4px 9px;border-radius:14px;font-size:0.7rem;font-weight:600;cursor:pointer;border:1.5px solid;-webkit-tap-highlight-color:transparent;font-family:var(--font)';
+    const stripe = `
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin-bottom:12px">
+        <div style="display:flex;gap:5px;padding:2px 1px">
+          ${stripeMonths.map(smk => {
+            const sel = txMultiMonths.has(smk);
+            const cur = smk === curMk && !multiActive;
+            const st  = sel ? `${CHIP};background:var(--accent);border-color:var(--accent);color:#fff`
+                       : cur ? `${CHIP};background:transparent;border-color:var(--accent);color:var(--accent)`
+                       :       `${CHIP};background:transparent;border-color:var(--border);color:var(--muted)`;
+            return `<button onclick="toggleTxMonth('${smk}')" style="${st}">${smk}</button>`;
+          }).join('')}
+          ${multiActive ? `<button onclick="txMultiMonths.clear();loadTransactions()" style="${CHIP};background:transparent;border-color:var(--border);color:var(--muted);margin-left:4px">✕</button>` : ''}
+        </div>
+      </div>`;
+
+    // ── Title ──────────────────────────────────────────────────────────────
+    let titleStr;
+    if (multiActive) {
+      const sorted = [...txMultiMonths].sort(mkSort);
+      titleStr = sorted.length <= 3 ? sorted.join(' · ') : `${sorted[0]} → ${sorted[sorted.length-1]}`;
+    } else {
+      titleStr = `${MONTHS_FULL[txMonth]} ${txYear}`;
+    }
+
+    // ── Filter pills ───────────────────────────────────────────────────────
+    const PILL = 'display:inline-flex;align-items:center;padding:5px 12px;border-radius:20px;font-size:0.76rem;font-weight:600;cursor:pointer;border:1.5px solid;-webkit-tap-highlight-color:transparent';
+    const pillStyle = (t, c) => txTypes.includes(t)
+      ? `${PILL};background:${c};border-color:${c};color:#fff`
       : `${PILL};background:transparent;border-color:var(--border);color:var(--muted)`;
-
     const typepills = `
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-        <button onclick="toggleTxType('Income')"   style="${pillStyle('Income',  'var(--green)', 'var(--green)')}">Income</button>
-        <button onclick="toggleTxType('Expense')"  style="${pillStyle('Expense', 'var(--red)',   'var(--red)')}">Expenses</button>
-        <button onclick="toggleTxType('Transfer')" style="${pillStyle('Transfer','#8b5cf6',      '#8b5cf6')}">Transfers</button>
+        <button onclick="toggleTxType('Income')"   style="${pillStyle('Income',  'var(--green)')}">Income</button>
+        <button onclick="toggleTxType('Expense')"  style="${pillStyle('Expense', 'var(--red)')}">Expenses</button>
+        <button onclick="toggleTxType('Transfer')" style="${pillStyle('Transfer','#8b5cf6')}">Transfers</button>
         ${txTypes.length || txCatF || txAcctF
           ? `<button onclick="txTypes=[];txCatF='';txAcctF='';loadTransactions()" style="${PILL};background:transparent;border-color:var(--border);color:var(--muted);margin-left:auto">✕ Clear</button>`
           : ''}
       </div>`;
 
-    const acctSel = `
-      <select onchange="txAcctF=this.value;loadTransactions()" style="flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:0.8rem;font-family:var(--font);background:var(--card);color:var(--text);cursor:pointer;min-width:0">
-        <option value="">All accounts</option>
-        ${uniqueAccts.map(a => `<option value="${a}" ${a===txAcctF?'selected':''}>${a}</option>`).join('')}
-      </select>`;
-    const catSel = `
-      <select onchange="txCatF=this.value;loadTransactions()" style="flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:0.8rem;font-family:var(--font);background:var(--card);color:var(--text);cursor:pointer;min-width:0">
-        <option value="">All categories</option>
-        ${allCats.map(c => `<option value="${c}" ${c===txCatF?'selected':''}>${c}</option>`).join('')}
-      </select>`;
+    const SEL = 'flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:0.8rem;font-family:var(--font);background:var(--card);color:var(--text);cursor:pointer;min-width:0';
+    const acctSel = `<select onchange="txAcctF=this.value;loadTransactions()" style="${SEL}">
+      <option value="">All accounts</option>
+      ${uniqueAccts.map(a => `<option value="${a}" ${a===txAcctF?'selected':''}>${a}</option>`).join('')}
+    </select>`;
+    const catSel = `<select onchange="txCatF=this.value;loadTransactions()" style="${SEL}">
+      <option value="">All categories</option>
+      ${allCats.map(c => `<option value="${c}" ${c===txCatF?'selected':''}>${c}</option>`).join('')}
+    </select>`;
 
-    const cards = txs.map(r => {
+    // ── Row rendering: 5-col grid ──────────────────────────────────────────
+    const rows = txs.map(r => {
       const isInc   = r.type === 'Income';
       const isTrans = r.type === 'Transfer';
-      const borderC = isInc ? 'var(--green)' : isTrans ? '#8b5cf6' : 'var(--red)';
-      const amtC    = isInc ? 'var(--green)' : isTrans ? '#8b5cf6' : 'var(--red)';
-      const sign    = isInc ? '+' : isTrans ? '' : '-';
-      const mainLabel = isTrans
-        ? `${r.from_account || '?'} → ${r.category || '?'}`
-        : r.category || '—';
-      const subLabel = isTrans
-        ? (r.notes || '')
-        : [r.sub_category, r.notes].filter(Boolean).join(' · ');
-      const badgeBg = isInc ? 'rgba(5,150,105,0.12)' : isTrans ? 'rgba(139,92,246,0.12)' : 'rgba(220,38,38,0.12)';
-      const badge = `<span style="font-size:0.6rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;padding:1px 5px;border-radius:4px;background:${badgeBg};color:${amtC}">${r.type}</span>`;
+      const barC = isInc ? 'var(--green)' : isTrans ? '#8b5cf6' : 'var(--red)';
+      const amtC = barC;
+      const sign = isInc ? '+' : isTrans ? '' : '-';
+
+      const [, mo, dy] = r.date.split('-');
+      const dayNum  = parseInt(dy, 10);
+      const monAbbr = MONTHS_ES[parseInt(mo, 10) - 1];
+
+      const catLabel  = isTrans ? `${r.from_account||'?'} → ${r.category||'?'}` : (r.category || '—');
+      const subLabel  = isTrans ? (r.notes || '') : [r.sub_category, r.notes].filter(Boolean).join(' · ');
+      const acctShort = !isTrans ? (ACCT_SHORT[r.from_account] || r.from_account || '—') : '';
+
+      const badgeLbl = isInc ? 'INC' : isTrans ? 'TRF' : 'EXP';
+      const badgeBg  = isInc ? 'rgba(5,150,105,0.13)' : isTrans ? 'rgba(139,92,246,0.13)' : 'rgba(220,38,38,0.13)';
+
       return `
-        <div style="display:flex;align-items:center;gap:0;padding:11px 0;border-bottom:1px solid var(--border)">
-          <div style="width:3px;align-self:stretch;background:${borderC};border-radius:2px;margin-right:12px;flex-shrink:0"></div>
-          <div style="flex:1;min-width:0">
-            <div style="display:flex;align-items:baseline;gap:6px">
-              <span style="font-size:0.82rem;font-weight:600;color:var(--text)">${mainLabel}</span>
-              ${badge}
-            </div>
-            ${subLabel ? `<div style="font-size:0.7rem;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${subLabel}</div>` : ''}
-            <div style="font-size:0.68rem;color:var(--muted);margin-top:1px">${r.date}${r.from_account && !isTrans ? ' · ' + r.from_account : ''}</div>
+        <div style="display:grid;grid-template-columns:4px 40px 1fr 46px auto;align-items:center;padding:8px 12px 8px 0;border-bottom:1px solid var(--border)">
+          <div style="background:${barC};align-self:stretch;border-radius:0 2px 2px 0"></div>
+          <div style="text-align:center;padding:0 6px;line-height:1.2">
+            <div style="font-size:0.92rem;font-weight:700;color:var(--text)">${dayNum}</div>
+            <div style="font-size:0.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em">${monAbbr}</div>
           </div>
-          <div style="font-size:0.92rem;font-weight:700;color:${amtC};font-variant-numeric:tabular-nums;white-space:nowrap;margin-left:10px">${sign}${fmt(+r.amount,0)}</div>
+          <div style="min-width:0;padding-right:4px">
+            <div style="font-size:0.79rem;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${catLabel}</div>
+            ${subLabel ? `<div style="font-size:0.65rem;color:var(--muted);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${subLabel}</div>` : ''}
+          </div>
+          <div style="font-size:0.65rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:6px">${acctShort}</div>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+            <span style="font-size:0.57rem;font-weight:700;letter-spacing:0.07em;padding:2px 5px;border-radius:4px;background:${badgeBg};color:${amtC}">${badgeLbl}</span>
+            <span style="font-size:0.87rem;font-weight:700;color:${amtC};font-variant-numeric:tabular-nums;white-space:nowrap">${sign}${fmt(+r.amount,0)}</span>
+          </div>
         </div>`;
     }).join('');
 
     el.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
         <button onclick="prevTxMonth()" style="width:36px;height:36px;border-radius:50%;border:1px solid var(--border);background:var(--card);font-size:1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent">←</button>
-        <span style="font-weight:700;font-size:1rem">${MONTHS_FULL[txMonth]} ${txYear}</span>
+        <span style="font-weight:700;font-size:0.95rem">${titleStr}</span>
         <button onclick="nextTxMonth()" style="width:36px;height:36px;border-radius:50%;border:1px solid var(--border);background:var(--card);font-size:1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent">→</button>
       </div>
-      <div class="kpi-row" style="margin-bottom:14px;grid-template-columns:repeat(4,1fr)">
+      ${stripe}
+      <div class="kpi-row" style="margin-bottom:12px;grid-template-columns:repeat(4,1fr)">
         <div class="kpi"><div class="kpi-label" style="font-size:0.6rem">Cash Income</div><div class="kpi-value green">${fmt(cashIncomeTx,0)}</div></div>
         <div class="kpi"><div class="kpi-label" style="font-size:0.6rem">Val & Interest</div><div class="kpi-value" style="color:#06b6d4">${valIncomeTx ? fmt(valIncomeTx,0) : '—'}</div></div>
         <div class="kpi"><div class="kpi-label">Expenses</div><div class="kpi-value red">${fmt(expense,0)}</div></div>
         <div class="kpi"><div class="kpi-label">Net</div><div class="kpi-value ${net>=0?'green':'red'}">${fmt(net,0)}</div></div>
       </div>
       ${typepills}
-      <div style="display:flex;gap:8px;margin-bottom:12px">
-        ${acctSel}${catSel}
-      </div>
+      <div style="display:flex;gap:8px;margin-bottom:12px">${acctSel}${catSel}</div>
       ${txs.length
-        ? `<div class="card" style="padding:0 14px">
-             ${cards}
-           </div>
+        ? `<div class="card" style="padding:0 0 0 0;overflow:hidden">${rows}</div>
            <div style="text-align:center;color:var(--muted);font-size:0.76rem;margin-top:8px;padding-bottom:4px">${txs.length} of ${allTxs.length} transactions</div>`
         : `<div class="card" style="text-align:center;color:var(--muted);padding:32px">
              <div style="font-size:1.8rem;margin-bottom:8px">📭</div>
              <div style="font-weight:600;color:var(--text)">No transactions match filters</div>
-             <div style="font-size:0.83rem;margin-top:4px">${mk}</div>
+             <div style="font-size:0.83rem;margin-top:4px">${multiActive ? [...txMultiMonths].join(' · ') : curMk}</div>
            </div>`}`;
   } catch(e) {
     el.innerHTML = `<div class="placeholder"><div class="icon">⚠️</div><h2>Error</h2><p>${e.message}</p></div>`;
@@ -1971,11 +2026,18 @@ async function loadTransactions() {
 }
 
 function prevTxMonth() {
+  txMultiMonths.clear();
   if (txMonth > 0) txMonth--; else { txMonth = 11; txYear--; }
   loadTransactions();
 }
 function nextTxMonth() {
+  txMultiMonths.clear();
   if (txMonth < 11) txMonth++; else { txMonth = 0; txYear++; }
+  loadTransactions();
+}
+function toggleTxMonth(mk) {
+  if (txMultiMonths.has(mk)) txMultiMonths.delete(mk);
+  else txMultiMonths.add(mk);
   loadTransactions();
 }
 
