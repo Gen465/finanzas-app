@@ -2706,7 +2706,7 @@ async function loadMortgage() {
       dbGet('accounts', '?select=name,balance'),
       // Fetch all years so the table and projection have full history
       dbGet('transactions', '?category=like.Mortgage%25&select=amount,category,month_year'),
-      dbGet('mortgage_events', '?order=effective_from.asc').catch(() => [])
+      dbGet('mortgage_events', '?order=effective_from.asc').catch(e => { console.error('mortgage_events fetch failed:', e.message); return []; })
     ]);
 
     const acctMapM = {};
